@@ -183,16 +183,25 @@ def create_temp_s3_state(meeting_id: str, sf_record: dict, doc_id: str, doc_url:
     prefix = f"temp/live-doc-history/{meeting_id}"
 
     # state.json
+    candidate  = sf_record.get("Candidate_Name__c", "Unknown")
+    company    = sf_record.get("Company__c", "Unknown")
+    host_name  = sf_record.get("Interviewer_s_Name__c", "Unknown")
+    now_utc    = datetime.now(timezone.utc)
+
     state = {
-        "meeting_id": meeting_id,
-        "doc_id": doc_id,
-        "doc_url": doc_url,
+        "meeting_id":           meeting_id,
+        "doc_id":               doc_id,
+        "doc_url":              doc_url,
         "salesforce_record_id": sf_record.get("Id"),
-        "candidate": sf_record.get("Candidate_Name__c", "Unknown"),
-        "company": sf_record.get("Company_Name__c", "Unknown"),
-        "host_name": sf_record.get("Host_Name__c", "Unknown"),
-        "status": "active",
-        "initialized_at": datetime.now(timezone.utc).isoformat(),
+        "candidate":            candidate,
+        "company":              company,
+        "host_name":            host_name,
+        "temp_s3_prefix":       f"temp/live-doc-history/{meeting_id}",
+        "final_s3_prefix":      "",
+        "final_doc_txt":        "",
+        "status":               "active",
+        "initialized_at":       now_utc.isoformat(),
+        "initialized_at_ist":   (now_utc + __import__("datetime").timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d %I:%M:%S %p IST"),
     }
     s3.put_object(
         Bucket=S3_BUCKET,
