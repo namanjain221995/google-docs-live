@@ -143,42 +143,51 @@ def get_all_active_docs() -> list:
 
 def find_final_s3_prefix(meeting_id: str) -> str | None:
     """
-    Searches S3 Interview-Success/ for a folder containing this meeting_id.
-    zoom-recording-processor creates this when recording is done.
+    Searches ALL department folders in S3 for a folder containing this meeting_id.
 
-    Key format:
-    Interview-Success/Host/Year/Month/Candidate/MeetingID/Company/Date/Round/Time/FileType/file.ext
-    We want prefix up to and including the Time/ level.
+    Path structures per department:
+      Interview-Success / Host / Year / Month / Candidate / MeetingID / Company / Date / Round / Time /
+        => time_offset = 4  (4 folders after meeting_id)
+
+      Training / Customer-Success / Marketing:
+      Dept / Host / Year / Month / Candidate / MeetingID / Date / Time /
+        => time_offset = 2  (2 folders after meeting_id)
     """
+    DEPARTMENTS = {
+        "Interview-Success": 4,
+        "Training":          2,
+        "Customer-Success":  2,
+        "Marketing":         2,
+    }
+
     paginator  = s3.get_paginator("list_objects_v2")
     search_str = f"/{meeting_id}/"
 
-    found_prefixes = set()
-    try:
-        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix="Interview-Success/"):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                if search_str in key:
-                    parts = key.split("/")
-                    try:
-                        mid_idx = parts.index(meeting_id)
-                        # Time folder is 4 levels after meeting_id
-                        # MeetingID / Company / Date / Round / Time
-                        if len(parts) > mid_idx + 5:
-                            time_prefix = "/".join(parts[:mid_idx + 5])
-                            found_prefixes.add(time_prefix)
-                    except ValueError:
-                        continue
-    except Exception as e:
-        log.error(f"S3 search error for meeting_id={meeting_id}: {e}")
-        return None
+    for department, time_offset in DEPARTMENTS.items():
+        found_prefixes = set()
+        try:
+            for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=f"{department}/"):
+                for obj in page.get("Contents", []):
+                    key = obj["Key"]
+                    if search_str in key:
+                        parts = key.split("/")
+                        try:
+                            mid_idx    = parts.index(meeting_id)
+                            prefix_end = mid_idx + time_offset + 1
+                            if len(parts) > prefix_end:
+                                time_prefix = "/".join(parts[:prefix_end])
+                                found_prefixes.add(time_prefix)
+                        except ValueError:
+                            continue
+            if found_prefixes:
+                result = sorted(found_prefixes)[0]
+                log.info(f"Found final S3 prefix in [{department}] for meeting_id={meeting_id}: {result}")
+                return result
+        except Exception as e:
+            log.error(f"S3 search error in {department} for meeting_id={meeting_id}: {e}")
+            continue
 
-    if found_prefixes:
-        result = sorted(found_prefixes)[0]
-        log.info(f"Found final S3 prefix for meeting_id={meeting_id}: {result}")
-        return result
-
-    log.info(f"No final S3 prefix found yet for meeting_id={meeting_id}")
+    log.info(f"No final S3 prefix found yet in any department for meeting_id={meeting_id}")
     return None
 
 
@@ -695,53 +704,71 @@ def signal_or_spawn_worker(executor: ThreadPoolExecutor, doc_id: str, meeting_id
 # ──────────────────────────────────────────────
 # PARSE INCOMING SQS MESSAGE
 # ──────────────────────────────────────────────
-def parse_change_message(msg_body: str) -> dict | None:
+def parse_change_message(msg_body: str, msg_attributes: dict = None) -> dict | None:
     """
     Google webhook → API Gateway → SQS.
-    The SQS body may contain:
-    - A Google Drive notification with headers passed as body
-    - Or just a wake-up signal with meeting_id in the message attributes
-    We extract doc_id from the Google headers or from our DB by channel_id.
+
+    Google Drive notifications send ALL data in HTTP HEADERS, not in the body.
+    The body is just a binary notification token (base64-like string).
+
+    API Gateway must be configured to forward these headers into the SQS message.
+    We look for channel_id in:
+    1. SQS MessageAttributes (if API Gateway forwards headers as attributes)
+    2. JSON body fields (if API Gateway maps headers to JSON)
+    3. Fallback: query ALL active docs and process all of them (safe fallback)
     """
-    try:
-        body = json.loads(msg_body)
+    channel_id   = ""
+    resource_id  = ""
+    resource_uri = ""
+    doc_id       = ""
 
-        # Check if it has doc_id directly (future enhancement)
-        if "doc_id" in body:
-            return body
+    # ── Try SQS MessageAttributes first (most reliable) ──
+    if msg_attributes:
+        channel_id  = msg_attributes.get("X-Goog-Channel-ID", {}).get("StringValue", "")
+        resource_id = msg_attributes.get("X-Goog-Resource-ID", {}).get("StringValue", "")
+        resource_uri= msg_attributes.get("X-Goog-Resource-URI", {}).get("StringValue", "")
 
-        # Google sends resource state change notifications with resourceId
-        # API Gateway can forward headers as body fields
-        resource_id  = body.get("resourceId", body.get("X-Goog-Resource-ID", ""))
-        channel_id   = body.get("channelId", body.get("X-Goog-Channel-ID", ""))
-        resource_uri = body.get("resourceUri", "")
+    # ── Try JSON body ──
+    if not channel_id:
+        try:
+            body       = json.loads(msg_body)
+            channel_id = body.get("channelId", body.get("X-Goog-Channel-ID", ""))
+            resource_id= body.get("resourceId", body.get("X-Goog-Resource-ID", ""))
+            resource_uri=body.get("resourceUri", "")
+            if "doc_id" in body:
+                return body
+        except Exception:
+            pass  # body is binary/base64 — that is normal for Google webhooks
 
-        # Extract doc_id from resourceUri if present
-        # URI format: https://www.googleapis.com/drive/v3/files/DOC_ID
-        doc_id = ""
-        if resource_uri:
-            parts = resource_uri.rstrip("/").split("/")
-            doc_id = parts[-1] if parts else ""
+    # ── Extract doc_id from resourceUri ──
+    if resource_uri:
+        parts  = resource_uri.rstrip("/").split("/")
+        doc_id = parts[-1] if parts else ""
 
-        # Fallback: lookup by channel_id in DB
-        if not doc_id and channel_id:
+    # ── Lookup by channel_id in DB ──
+    if not doc_id and channel_id:
+        try:
             conn = get_db()
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT doc_id, meeting_id FROM doc_watch_state WHERE watch_channel_id = %s LIMIT 1",
+                    "SELECT doc_id FROM doc_watch_state WHERE watch_channel_id = %s LIMIT 1",
                     (channel_id,)
                 )
                 row = cur.fetchone()
                 if row:
                     doc_id = row["doc_id"]
+                    log.info(f"Resolved doc_id={doc_id} from channel_id={channel_id}")
+        except Exception as e:
+            log.warning(f"DB channel lookup failed: {e}")
 
-        if doc_id:
-            return {"doc_id": doc_id}
+    if doc_id:
+        return {"doc_id": doc_id}
 
-    except Exception as e:
-        log.warning(f"Could not parse change message: {e} body={msg_body[:200]}")
-
-    return None
+    # ── FALLBACK: Google sent a notification but we cannot identify which doc ──
+    # This happens when API Gateway does not forward headers.
+    # Safe fallback: return a special signal to process ALL active docs.
+    log.warning(f"Cannot identify doc from message — will process all active docs as fallback")
+    return {"process_all_active": True}
 
 # ──────────────────────────────────────────────
 # MAIN LOOP
@@ -808,23 +835,36 @@ def main():
                     QueueUrl=CHANGE_QUEUE_URL,
                     MaxNumberOfMessages=10,
                     WaitTimeSeconds=20,
-                    VisibilityTimeout=90
+                    VisibilityTimeout=90,
+                    MessageAttributeNames=["All"]
                 )
                 messages = resp.get("Messages", [])
 
                 for msg in messages:
-                    receipt = msg["ReceiptHandle"]
+                    receipt    = msg["ReceiptHandle"]
+                    attributes = msg.get("MessageAttributes", {})
                     try:
-                        parsed = parse_change_message(msg["Body"])
+                        parsed = parse_change_message(msg["Body"], attributes)
 
-                        if not parsed or not parsed.get("doc_id"):
-                            log.warning(f"Could not extract doc_id from SQS message, skipping")
+                        if not parsed:
                             sqs.delete_message(QueueUrl=CHANGE_QUEUE_URL, ReceiptHandle=receipt)
                             continue
 
-                        doc_id = parsed["doc_id"]
+                        # ── FALLBACK: process all active docs ──
+                        if parsed.get("process_all_active"):
+                            active_docs = get_all_active_docs()
+                            log.info(f"Fallback: signaling {len(active_docs)} active docs")
+                            for doc_record in active_docs:
+                                signal_or_spawn_worker(
+                                    executor,
+                                    doc_record["doc_id"],
+                                    doc_record["meeting_id"]
+                                )
+                            sqs.delete_message(QueueUrl=CHANGE_QUEUE_URL, ReceiptHandle=receipt)
+                            continue
 
-                        # Look up tracked doc
+                        # ── NORMAL: specific doc_id identified ──
+                        doc_id = parsed["doc_id"]
                         doc_record = get_tracked_doc_by_doc_id(doc_id)
                         if not doc_record:
                             log.info(f"doc_id={doc_id} not in tracked_docs, ignoring")
@@ -832,11 +872,7 @@ def main():
                             continue
 
                         meeting_id = doc_record["meeting_id"]
-
-                        # Signal or spawn worker
                         signal_or_spawn_worker(executor, doc_id, meeting_id)
-
-                        # Delete message after signaling
                         sqs.delete_message(QueueUrl=CHANGE_QUEUE_URL, ReceiptHandle=receipt)
 
                     except Exception as e:
