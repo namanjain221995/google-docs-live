@@ -339,72 +339,83 @@ def get_last_snapshot_content(meeting_id: str, doc_id: str) -> str | None:
 def extract_text_from_doc(doc_id: str) -> tuple[str, list]:
     """
     Returns (plain_text, image_refs_list)
-    Uses Drive export API for clean UTF-8 plain text.
-    Uses Docs API only for image detection.
+    Uses Drive export_media for raw bytes then decodes properly.
     """
-    import unicodedata
+    import io
+    from googleapiclient.http import MediaIoBaseDownload
 
-    # ── Get plain text via Drive export (cleanest UTF-8, no encoding issues) ──
     drive = get_drive_service()
+
+    # ── Fetch raw bytes using export_media ──
+    plain_text = ""
     try:
-        resp = drive.files().export(
-            fileId=doc_id,
-            mimeType="text/plain"
-        ).execute()
+        request    = drive.files().export_media(fileId=doc_id, mimeType="text/plain")
+        buffer     = io.BytesIO()
+        downloader = MediaIoBaseDownload(buffer, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        raw_bytes = buffer.getvalue()
 
-        if isinstance(resp, bytes):
-            # utf-8-sig strips the UTF-8 BOM (ï»¿) if present
-            plain_text = resp.decode("utf-8-sig")
-        else:
-            plain_text = resp
+        # Step 1: decode raw bytes as utf-8, stripping BOM
+        plain_text = raw_bytes.decode("utf-8-sig")
 
-        plain_text = unicodedata.normalize("NFC", plain_text)
+        # Step 2: fix double-encoding corruption
+        # Google API sometimes double-encodes UTF-8 as latin-1
+        # â€™ (3 bytes) -> ' is the sign of this issue
+        # Fix: re-encode as latin-1 then decode as utf-8
+        if "â€" in plain_text or "Ã" in plain_text:
+            try:
+                plain_text = plain_text.encode("latin-1").decode("utf-8")
+            except (UnicodeDecodeError, UnicodeEncodeError):
+                pass
+
     except Exception as e:
-        log.warning(f"Drive export failed for doc_id={doc_id}, falling back to Docs API: {e}")
-        # Fallback to Docs API text extraction
-        docs = get_docs_service()
-        doc  = docs.documents().get(documentId=doc_id).execute()
-        text_parts = []
-        for element in doc.get("body", {}).get("content", []):
-            if "paragraph" in element:
-                for pe in element["paragraph"].get("elements", []):
-                    if "textRun" in pe:
-                        text_parts.append(pe["textRun"].get("content", ""))
-        plain_text = unicodedata.normalize("NFC", "".join(text_parts))
+        log.warning(f"export_media failed for doc_id={doc_id}: {e}")
+        # Fallback: use Docs API
+        try:
+            docs = get_docs_service()
+            doc  = docs.documents().get(documentId=doc_id).execute()
+            parts = []
+            for el in doc.get("body", {}).get("content", []):
+                if "paragraph" in el:
+                    for pe in el["paragraph"].get("elements", []):
+                        if "textRun" in pe:
+                            parts.append(pe["textRun"].get("content", ""))
+            plain_text = "".join(parts)
+            if "â€" in plain_text or "Ã" in plain_text:
+                try:
+                    plain_text = plain_text.encode("latin-1").decode("utf-8")
+                except (UnicodeDecodeError, UnicodeEncodeError):
+                    pass
+        except Exception as e2:
+            log.error(f"Both export methods failed for doc_id={doc_id}: {e2}")
 
-    # ── Get image refs via Docs API ──
+    # ── Detect images via Docs API ──
     enriched_images = []
     try:
         docs           = get_docs_service()
         doc            = docs.documents().get(documentId=doc_id).execute()
         inline_objects = doc.get("inlineObjects", {})
-        image_refs     = []
-
-        for element in doc.get("body", {}).get("content", []):
-            if "paragraph" in element:
-                for pe in element["paragraph"].get("elements", []):
+        for el in doc.get("body", {}).get("content", []):
+            if "paragraph" in el:
+                for pe in el["paragraph"].get("elements", []):
                     if "inlineObjectElement" in pe:
                         obj_id = pe["inlineObjectElement"].get("inlineObjectId", "")
                         if obj_id:
-                            image_refs.append(obj_id)
-
-        for obj_id in image_refs:
-            obj   = inline_objects.get(obj_id, {})
-            props = obj.get("inlineObjectProperties", {}).get("embeddedObject", {})
-            uri   = props.get("imageProperties", {}).get("sourceUri", "")
-            enriched_images.append({
-                "inline_object_id": obj_id,
-                "source_uri": uri,
-                "title": props.get("title", "")
-            })
+                            obj   = inline_objects.get(obj_id, {})
+                            props = obj.get("inlineObjectProperties", {}).get("embeddedObject", {})
+                            enriched_images.append({
+                                "inline_object_id": obj_id,
+                                "source_uri": props.get("imageProperties", {}).get("sourceUri", ""),
+                                "title": props.get("title", "")
+                            })
     except Exception as e:
         log.warning(f"Image detection failed for doc_id={doc_id}: {e}")
 
     return plain_text, enriched_images
 
-# ──────────────────────────────────────────────
-# GET LAST EDITOR FROM DRIVE REVISIONS
-# ──────────────────────────────────────────────
+
 def get_last_editor(doc_id: str) -> str:
     try:
         drive = get_drive_service()
