@@ -59,7 +59,7 @@ GOOGLE_SECRET_NAME=google/doc-history-service-account
 DB_HOST=localhost
 DB_NAME=dochistory
 DB_USER=postgres
-DB_PASS=123456789
+DB_PASS=your_db_password_here
 DB_PORT=5432
 ENV
 

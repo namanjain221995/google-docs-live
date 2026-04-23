@@ -141,7 +141,141 @@ def get_all_active_docs() -> list:
         cur.execute("SELECT * FROM tracked_docs WHERE is_active = TRUE AND status = 'active'")
         return cur.fetchall()
 
+def find_final_s3_prefix(meeting_id: str) -> str | None:
+    """
+    Searches S3 Interview-Success/ for a folder containing this meeting_id.
+    zoom-recording-processor creates this when recording is done.
+
+    Key format:
+    Interview-Success/Host/Year/Month/Candidate/MeetingID/Company/Date/Round/Time/FileType/file.ext
+    We want prefix up to and including the Time/ level.
+    """
+    paginator  = s3.get_paginator("list_objects_v2")
+    search_str = f"/{meeting_id}/"
+
+    found_prefixes = set()
+    try:
+        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix="Interview-Success/"):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if search_str in key:
+                    parts = key.split("/")
+                    try:
+                        mid_idx = parts.index(meeting_id)
+                        # Time folder is 4 levels after meeting_id
+                        # MeetingID / Company / Date / Round / Time
+                        if len(parts) > mid_idx + 5:
+                            time_prefix = "/".join(parts[:mid_idx + 5])
+                            found_prefixes.add(time_prefix)
+                    except ValueError:
+                        continue
+    except Exception as e:
+        log.error(f"S3 search error for meeting_id={meeting_id}: {e}")
+        return None
+
+    if found_prefixes:
+        result = sorted(found_prefixes)[0]
+        log.info(f"Found final S3 prefix for meeting_id={meeting_id}: {result}")
+        return result
+
+    log.info(f"No final S3 prefix found yet for meeting_id={meeting_id}")
+    return None
+
+
+def finalize_to_final_path(meeting_id: str, final_prefix: str) -> bool:
+    """
+    Copies temp doc.txt + images + snapshots to final Interview-Success path.
+    temp/live-doc-history/<meeting_id>/doc.txt
+        → <final_prefix>/docs/doc.txt
+    """
+    temp_prefix = f"temp/live-doc-history/{meeting_id}"
+    docs_prefix = f"{final_prefix}/docs"
+
+    # Copy doc.txt
+    src = f"{temp_prefix}/doc.txt"
+    dst = f"{docs_prefix}/doc.txt"
+    try:
+        obj     = s3.get_object(Bucket=S3_BUCKET, Key=src)
+        content = obj["Body"].read().decode("utf-8")
+        # Update S3 location line inside the file
+        content = content.replace(
+            f"s3://{S3_BUCKET}/{temp_prefix}/doc.txt",
+            f"s3://{S3_BUCKET}/{dst}"
+        )
+        finalized_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        content += (
+            f"\n\n==================================================\n"
+            f"FINALIZED AT: {finalized_at}\n"
+            f"Final S3 Path: s3://{S3_BUCKET}/{dst}\n"
+        )
+        s3.put_object(
+            Bucket=S3_BUCKET,
+            Key=dst,
+            Body=content.encode("utf-8"),
+            ContentType="text/plain"
+        )
+        log.info(f"doc.txt → s3://{S3_BUCKET}/{dst}")
+    except Exception as e:
+        log.error(f"Failed to copy doc.txt for meeting_id={meeting_id}: {e}")
+        return False
+
+    # Copy images
+    paginator = s3.get_paginator("list_objects_v2")
+    try:
+        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=f"{temp_prefix}/images/"):
+            for obj in page.get("Contents", []):
+                fname = obj["Key"].split("/")[-1]
+                s3.copy_object(
+                    Bucket=S3_BUCKET,
+                    CopySource={"Bucket": S3_BUCKET, "Key": obj["Key"]},
+                    Key=f"{docs_prefix}/images/{fname}"
+                )
+    except Exception as e:
+        log.warning(f"Image copy warning: {e}")
+
+    # Copy snapshots
+    try:
+        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=f"{temp_prefix}/snapshots/"):
+            for obj in page.get("Contents", []):
+                fname = obj["Key"].split("/")[-1]
+                s3.copy_object(
+                    Bucket=S3_BUCKET,
+                    CopySource={"Bucket": S3_BUCKET, "Key": obj["Key"]},
+                    Key=f"{docs_prefix}/snapshots/{fname}"
+                )
+    except Exception as e:
+        log.warning(f"Snapshot copy warning: {e}")
+
+    return True
+
+
 def mark_doc_idle(meeting_id: str):
+    """
+    Called when worker hits 30-min idle timeout.
+    1. Search S3 for final Interview-Success path
+    2. Found → finalize immediately
+    3. Not found → mark idle, idle_retry_loop will retry every 10 min
+    """
+    log.info(f"30-min idle for meeting_id={meeting_id} — searching final S3 path")
+    final_prefix = find_final_s3_prefix(meeting_id)
+
+    if final_prefix:
+        success = finalize_to_final_path(meeting_id, final_prefix)
+        if success:
+            conn = get_db()
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE tracked_docs SET
+                        status = 'finalized',
+                        is_active = FALSE,
+                        updated_at = NOW()
+                    WHERE meeting_id = %s
+                """, (meeting_id,))
+                conn.commit()
+            log.info(f"✅ FINALIZED meeting_id={meeting_id} → {final_prefix}/docs/doc.txt")
+            return
+
+    # Recording not ready yet — mark idle for retry
     conn = get_db()
     with conn.cursor() as cur:
         cur.execute(
@@ -149,7 +283,7 @@ def mark_doc_idle(meeting_id: str):
             (meeting_id,)
         )
         conn.commit()
-    log.info(f"Marked meeting_id={meeting_id} as IDLE (30-min timeout)")
+    log.info(f"Recording folder not ready yet for meeting_id={meeting_id} — marked IDLE for retry")
 
 def update_last_change(meeting_id: str):
     conn = get_db()
@@ -612,8 +746,60 @@ def parse_change_message(msg_body: str) -> dict | None:
 # ──────────────────────────────────────────────
 # MAIN LOOP
 # ──────────────────────────────────────────────
+def idle_retry_loop():
+    """
+    Background thread — every 10 min checks 'idle' docs and
+    tries to finalize them if the recording S3 folder now exists.
+    Gives up after 6 hours.
+    """
+    RETRY_INTERVAL  = 10 * 60   # 10 minutes
+    MAX_RETRY_HOURS = 6
+
+    while True:
+        time.sleep(RETRY_INTERVAL)
+        try:
+            conn = get_db()
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT meeting_id FROM tracked_docs
+                    WHERE status = 'idle'
+                      AND is_active = TRUE
+                      AND updated_at > NOW() - INTERVAL '6 hours'
+                """)
+                idle_docs = cur.fetchall()
+            conn.close()
+
+            if idle_docs:
+                log.info(f"Idle retry: checking {len(idle_docs)} idle docs")
+            for row in idle_docs:
+                mid          = row["meeting_id"]
+                final_prefix = find_final_s3_prefix(mid)
+                if final_prefix:
+                    success = finalize_to_final_path(mid, final_prefix)
+                    if success:
+                        conn2 = get_db()
+                        with conn2.cursor() as cur:
+                            cur.execute("""
+                                UPDATE tracked_docs SET
+                                    status = 'finalized',
+                                    is_active = FALSE,
+                                    updated_at = NOW()
+                                WHERE meeting_id = %s
+                            """, (mid,))
+                            conn2.commit()
+                        conn2.close()
+                        log.info(f"✅ Retry finalized meeting_id={mid}")
+        except Exception as e:
+            log.error(f"Idle retry loop error: {e}", exc_info=True)
+
+
 def main():
     log.info(f"google_change_worker starting — max_workers={MAX_WORKERS} idle_timeout={IDLE_TIMEOUT_SECONDS}s")
+
+    # Start idle retry background thread
+    retry_thread = threading.Thread(target=idle_retry_loop, daemon=True, name="idle-retry")
+    retry_thread.start()
+    log.info("Idle retry thread started — checks every 10 min for unfinalized idle docs")
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="doc-worker") as executor:
         while True:
