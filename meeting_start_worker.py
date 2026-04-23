@@ -288,10 +288,16 @@ def upsert_tracked_doc(conn, meeting_id, doc_id, doc_url, sf_record, temp_prefix
 # PROCESS ONE MEETING.STARTED MESSAGE
 # ──────────────────────────────────────────────
 def process_message(body: dict, conn):
-    # Zoom sends nested payload: payload.object.id = meeting_id
-    payload = body.get("payload", {})
-    meeting_obj = payload.get("object", {})
-    meeting_id = str(meeting_obj.get("id", ""))
+    # Zoom webhook sends: {event, account_id, object: {id, topic, ...}}
+    # Try direct object.id first (current Zoom format)
+    meeting_obj = body.get("object", {})
+    meeting_id  = str(meeting_obj.get("id", ""))
+
+    # Fallback: old payload wrapper format
+    if not meeting_id:
+        payload     = body.get("payload", {})
+        meeting_obj = payload.get("object", {})
+        meeting_id  = str(meeting_obj.get("id", ""))
 
     if not meeting_id:
         log.warning(f"No meeting_id found in message body: {body}")
