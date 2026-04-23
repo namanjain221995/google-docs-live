@@ -1,0 +1,13 @@
+AWS_REGION=us-east-1
+S3_BUCKET=zoom-automation-bucket
+MEETING_START_QUEUE_URL=https://sqs.us-east-1.amazonaws.com/985100584614/zoom-meeting-start-queue
+CHANGE_QUEUE_URL=https://sqs.us-east-1.amazonaws.com/985100584614/google-doc-change-queue
+GOOGLE_WEBHOOK_URL=https://5cs3mviba8.execute-api.us-east-1.amazonaws.com/google-drive/webhook
+SF_SECRET_NAME=sf/jwt/credentials
+GOOGLE_SECRET_NAME=google/doc-history-service-account
+DB_HOST=127.0.0.1
+DB_NAME=dochistory
+DB_USER=postgres
+DB_PASS=DocHistory2026
+DB_PORT=5432
+DELETE_TEMP_AFTER_FINALIZE=false
