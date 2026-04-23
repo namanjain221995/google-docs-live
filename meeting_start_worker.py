@@ -179,14 +179,71 @@ def register_file_watch(doc_id: str, meeting_id: str) -> dict | None:
 # ──────────────────────────────────────────────
 # S3 HELPERS
 # ──────────────────────────────────────────────
+def find_final_s3_prefix_early(meeting_id: str) -> str:
+    """
+    Search S3 Interview-Success/ for existing folder with this meeting_id.
+    Called at meeting start — may already exist if recording happened fast.
+    Usually returns empty string (recording not done yet at meeting start).
+
+    Path structures:
+      Interview-Success / Host / Year / Month / Candidate / MeetingID / Company / Date / Round / Time /
+        => offset 4 after meeting_id
+      Training / Customer-Success / Marketing:
+      Dept / Host / Year / Month / Candidate / MeetingID / Date / Time /
+        => offset 2 after meeting_id
+    """
+    DEPARTMENTS = {
+        "Interview-Success": 4,
+        "Training":          2,
+        "Customer-Success":  2,
+        "Marketing":         2,
+    }
+    paginator  = s3.get_paginator("list_objects_v2")
+    search_str = f"/{meeting_id}/"
+
+    for department, time_offset in DEPARTMENTS.items():
+        try:
+            found = set()
+            for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=f"{department}/"):
+                for obj in page.get("Contents", []):
+                    key = obj["Key"]
+                    if search_str in key:
+                        parts = key.split("/")
+                        try:
+                            mid_idx    = parts.index(meeting_id)
+                            prefix_end = mid_idx + time_offset + 1
+                            if len(parts) > prefix_end:
+                                found.add("/".join(parts[:prefix_end]))
+                        except ValueError:
+                            continue
+            if found:
+                result = sorted(found)[0]
+                log.info(f"Found final S3 prefix at meeting start for meeting_id={meeting_id}: {result}")
+                return result
+        except Exception as e:
+            log.warning(f"S3 search error in {department}: {e}")
+    return ""
+
+
 def create_temp_s3_state(meeting_id: str, sf_record: dict, doc_id: str, doc_url: str):
     prefix = f"temp/live-doc-history/{meeting_id}"
 
-    # state.json
-    candidate  = sf_record.get("Candidate_Name__c", "Unknown")
-    company    = sf_record.get("Company__c", "Unknown")
-    host_name  = sf_record.get("Interviewer_s_Name__c", "Unknown")
-    now_utc    = datetime.now(timezone.utc)
+    # Get best available values with fallbacks
+    candidate = (sf_record.get("Candidate_Name__c")
+                 or sf_record.get("Name")
+                 or "Unknown")
+    company   = (sf_record.get("Company__c")
+                 or "Unknown")
+    host_name = (sf_record.get("Interviewer_s_Name__c")
+                 or sf_record.get("Interviewer_s_Email__c")
+                 or sf_record.get("Recruiter_Name__c")
+                 or "Unknown")
+
+    now_utc = datetime.now(timezone.utc)
+
+    # Try to find final S3 path right now at meeting start
+    final_prefix = find_final_s3_prefix_early(meeting_id)
+    final_doc_txt = f"s3://{S3_BUCKET}/{final_prefix}/docs/doc.txt" if final_prefix else ""
 
     state = {
         "meeting_id":           meeting_id,
@@ -197,8 +254,8 @@ def create_temp_s3_state(meeting_id: str, sf_record: dict, doc_id: str, doc_url:
         "company":              company,
         "host_name":            host_name,
         "temp_s3_prefix":       f"temp/live-doc-history/{meeting_id}",
-        "final_s3_prefix":      "",
-        "final_doc_txt":        "",
+        "final_s3_prefix":      final_prefix,
+        "final_doc_txt":        final_doc_txt,
         "status":               "active",
         "initialized_at":       now_utc.isoformat(),
         "initialized_at_ist":   (now_utc + __import__("datetime").timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d %I:%M:%S %p IST"),
@@ -211,8 +268,8 @@ def create_temp_s3_state(meeting_id: str, sf_record: dict, doc_id: str, doc_url:
     )
 
     # Initial doc.txt
-    candidate  = sf_record.get("Candidate_Name__c", "Unknown")
-    company    = sf_record.get("Company_Name__c", "Unknown")
+    candidate  = (sf_record.get("Candidate_Name__c") or sf_record.get("Name") or "Unknown")
+    company    = (sf_record.get("Company__c") or "Unknown")
     s3_loc     = f"s3://{S3_BUCKET}/{prefix}/doc.txt"
     now_str    = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
