@@ -110,7 +110,7 @@ def lookup_salesforce(meeting_id: str) -> dict | None:
     query = f"""
         SELECT Id, Name, Zoom_Meeting_Id__c,
                Google_Docs_ID__c, Google_Docs_URL__c,
-               Candidate_Name__c, Company__c, Interviewer_s_Name__c
+               Candidate_Name__c, Company_Name__c, Host_Name__c
         FROM Interview__c
         WHERE Zoom_Meeting_Id__c = '{meeting_id}'
         LIMIT 1
@@ -212,7 +212,7 @@ def create_temp_s3_state(meeting_id: str, sf_record: dict, doc_id: str, doc_url:
 
     # Initial doc.txt
     candidate  = sf_record.get("Candidate_Name__c", "Unknown")
-    company    = sf_record.get("Company__c", "Unknown")
+    company    = sf_record.get("Company_Name__c", "Unknown")
     s3_loc     = f"s3://{S3_BUCKET}/{prefix}/doc.txt"
     now_str    = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -268,8 +268,8 @@ def upsert_tracked_doc(conn, meeting_id, doc_id, doc_url, sf_record, temp_prefix
             meeting_id, doc_id, doc_url,
             sf_record.get("Id"),
             sf_record.get("Candidate_Name__c", "Unknown"),
-            sf_record.get("Company__c", "Unknown"),
-            sf_record.get("Interviewer_s_Name__c", "Unknown"),
+            sf_record.get("Company_Name__c", "Unknown"),
+            sf_record.get("Host_Name__c", "Unknown"),
             temp_prefix
         ))
 
