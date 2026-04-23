@@ -339,15 +339,25 @@ def get_last_snapshot_content(meeting_id: str, doc_id: str) -> str | None:
 def extract_text_from_doc(doc_id: str) -> tuple[str, list]:
     """
     Returns (plain_text, image_refs_list)
-    Uses Drive export_media for raw bytes then decodes properly.
+    Two methods tried in order:
+    1. export_media as text/plain (fast, clean)
+    2. Docs API JSON parsing (fallback if export fails)
+    Both apply latin-1 -> utf-8 re-encode to fix Google encoding corruption.
     """
     import io
     from googleapiclient.http import MediaIoBaseDownload
 
-    drive = get_drive_service()
-
-    # ── Fetch raw bytes using export_media ──
+    drive      = get_drive_service()
     plain_text = ""
+
+    def fix_encoding(text: str) -> str:
+        """Fix UTF-8 bytes that were decoded as latin-1 by Google API."""
+        try:
+            return text.encode("latin-1").decode("utf-8").lstrip("\ufeff")
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            return text.lstrip("\ufeff")
+
+    # ── Method 1: export_media (preferred) ──
     try:
         request    = drive.files().export_media(fileId=doc_id, mimeType="text/plain")
         buffer     = io.BytesIO()
@@ -355,24 +365,14 @@ def extract_text_from_doc(doc_id: str) -> tuple[str, list]:
         done = False
         while not done:
             _, done = downloader.next_chunk()
-        raw_bytes = buffer.getvalue()
-
-        # Step 1: decode raw bytes as utf-8, stripping BOM
-        plain_text = raw_bytes.decode("utf-8-sig")
-
-        # Step 2: fix double-encoding corruption
-        # Google API sometimes double-encodes UTF-8 as latin-1
-        # â€™ (3 bytes) -> ' is the sign of this issue
-        # Fix: re-encode as latin-1 then decode as utf-8
-        if "â€" in plain_text or "Ã" in plain_text:
-            try:
-                plain_text = plain_text.encode("latin-1").decode("utf-8")
-            except (UnicodeDecodeError, UnicodeEncodeError):
-                pass
+        raw_bytes  = buffer.getvalue()
+        plain_text = fix_encoding(raw_bytes.decode("latin-1"))
+        log.info(f"export_media success for doc_id={doc_id} length={len(plain_text)}")
 
     except Exception as e:
-        log.warning(f"export_media failed for doc_id={doc_id}: {e}")
-        # Fallback: use Docs API
+        log.warning(f"export_media failed for doc_id={doc_id} ({e}) — trying Docs API fallback")
+
+        # ── Method 2: Docs API JSON (fallback) ──
         try:
             docs = get_docs_service()
             doc  = docs.documents().get(documentId=doc_id).execute()
@@ -382,14 +382,19 @@ def extract_text_from_doc(doc_id: str) -> tuple[str, list]:
                     for pe in el["paragraph"].get("elements", []):
                         if "textRun" in pe:
                             parts.append(pe["textRun"].get("content", ""))
-            plain_text = "".join(parts)
-            if "â€" in plain_text or "Ã" in plain_text:
-                try:
-                    plain_text = plain_text.encode("latin-1").decode("utf-8")
-                except (UnicodeDecodeError, UnicodeEncodeError):
-                    pass
+                elif "table" in el:
+                    for row in el["table"].get("tableRows", []):
+                        for cell in row.get("tableCells", []):
+                            for cel in cell.get("content", []):
+                                if "paragraph" in cel:
+                                    for pe in cel["paragraph"].get("elements", []):
+                                        if "textRun" in pe:
+                                            parts.append(pe["textRun"].get("content", ""))
+            plain_text = fix_encoding("".join(parts))
+            log.info(f"Docs API fallback success for doc_id={doc_id} length={len(plain_text)}")
+
         except Exception as e2:
-            log.error(f"Both export methods failed for doc_id={doc_id}: {e2}")
+            log.error(f"Both methods failed for doc_id={doc_id}: {e2}")
 
     # ── Detect images via Docs API ──
     enriched_images = []
