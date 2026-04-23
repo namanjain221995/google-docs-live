@@ -110,7 +110,7 @@ def lookup_salesforce(meeting_id: str) -> dict | None:
     query = f"""
         SELECT Id, Name, Zoom_Meeting_Id__c,
                Google_Docs_ID__c, Google_Docs_URL__c,
-               Candidate_Name__c, Company_Name__c, Host_Name__c
+               Candidate_Name__c, Company__c, Interviewer_s_Name__c, Interviewer_s_Email__c
         FROM Interview__c
         WHERE Zoom_Meeting_Id__c = '{meeting_id}'
         LIMIT 1
