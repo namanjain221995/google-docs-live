@@ -307,11 +307,11 @@ def get_next_version(meeting_id: str, doc_id: str) -> int:
     conn = get_db()
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT COALESCE(MAX(version_number), 0) FROM doc_snapshots WHERE meeting_id = %s AND doc_id = %s",
+            "SELECT COALESCE(MAX(version_number), 0) AS coalesce FROM doc_snapshots WHERE meeting_id = %s AND doc_id = %s",
             (meeting_id, doc_id)
         )
         row = cur.fetchone()
-        return (row[0] if row else 0) + 1
+        return (row["coalesce"] if row and row["coalesce"] is not None else 0) + 1
 
 def save_snapshot(meeting_id: str, doc_id: str, version: int, content: str, edited_by: str):
     conn = get_db()
@@ -339,52 +339,67 @@ def get_last_snapshot_content(meeting_id: str, doc_id: str) -> str | None:
 def extract_text_from_doc(doc_id: str) -> tuple[str, list]:
     """
     Returns (plain_text, image_refs_list)
-    image_refs_list = [{"inline_object_id": ..., "title": ...}, ...]
+    Uses Drive export API for clean UTF-8 plain text.
+    Uses Docs API only for image detection.
     """
-    docs = get_docs_service()
-    doc  = docs.documents().get(documentId=doc_id).execute()
+    import unicodedata
 
-    text_parts   = []
-    image_refs   = []
+    # ── Get plain text via Drive export (cleanest UTF-8, no encoding issues) ──
+    drive = get_drive_service()
+    try:
+        resp = drive.files().export(
+            fileId=doc_id,
+            mimeType="text/plain"
+        ).execute()
 
-    body_content = doc.get("body", {}).get("content", [])
+        if isinstance(resp, bytes):
+            # utf-8-sig strips the UTF-8 BOM (ï»¿) if present
+            plain_text = resp.decode("utf-8-sig")
+        else:
+            plain_text = resp
 
-    for element in body_content:
-        if "paragraph" in element:
-            para = element["paragraph"]
-            for pe in para.get("elements", []):
-                if "textRun" in pe:
-                    text_parts.append(pe["textRun"].get("content", ""))
-                elif "inlineObjectElement" in pe:
-                    obj_id = pe["inlineObjectElement"].get("inlineObjectId", "")
-                    if obj_id:
-                        image_refs.append({"inline_object_id": obj_id})
+        plain_text = unicodedata.normalize("NFC", plain_text)
+    except Exception as e:
+        log.warning(f"Drive export failed for doc_id={doc_id}, falling back to Docs API: {e}")
+        # Fallback to Docs API text extraction
+        docs = get_docs_service()
+        doc  = docs.documents().get(documentId=doc_id).execute()
+        text_parts = []
+        for element in doc.get("body", {}).get("content", []):
+            if "paragraph" in element:
+                for pe in element["paragraph"].get("elements", []):
+                    if "textRun" in pe:
+                        text_parts.append(pe["textRun"].get("content", ""))
+        plain_text = unicodedata.normalize("NFC", "".join(text_parts))
 
-        elif "table" in element:
-            for row in element["table"].get("tableRows", []):
-                for cell in row.get("tableCells", []):
-                    for cell_el in cell.get("content", []):
-                        if "paragraph" in cell_el:
-                            for pe in cell_el["paragraph"].get("elements", []):
-                                if "textRun" in pe:
-                                    text_parts.append(pe["textRun"].get("content", ""))
-
-    # Enrich image refs with source URIs from inlineObjects
-    inline_objects = doc.get("inlineObjects", {})
+    # ── Get image refs via Docs API ──
     enriched_images = []
-    for ref in image_refs:
-        obj_id = ref["inline_object_id"]
-        obj    = inline_objects.get(obj_id, {})
-        props  = obj.get("inlineObjectProperties", {}).get("embeddedObject", {})
-        uri    = props.get("imageProperties", {}).get("sourceUri", "")
-        title  = props.get("title", "")
-        enriched_images.append({
-            "inline_object_id": obj_id,
-            "source_uri": uri,
-            "title": title
-        })
+    try:
+        docs           = get_docs_service()
+        doc            = docs.documents().get(documentId=doc_id).execute()
+        inline_objects = doc.get("inlineObjects", {})
+        image_refs     = []
 
-    plain_text = "".join(text_parts)
+        for element in doc.get("body", {}).get("content", []):
+            if "paragraph" in element:
+                for pe in element["paragraph"].get("elements", []):
+                    if "inlineObjectElement" in pe:
+                        obj_id = pe["inlineObjectElement"].get("inlineObjectId", "")
+                        if obj_id:
+                            image_refs.append(obj_id)
+
+        for obj_id in image_refs:
+            obj   = inline_objects.get(obj_id, {})
+            props = obj.get("inlineObjectProperties", {}).get("embeddedObject", {})
+            uri   = props.get("imageProperties", {}).get("sourceUri", "")
+            enriched_images.append({
+                "inline_object_id": obj_id,
+                "source_uri": uri,
+                "title": props.get("title", "")
+            })
+    except Exception as e:
+        log.warning(f"Image detection failed for doc_id={doc_id}: {e}")
+
     return plain_text, enriched_images
 
 # ──────────────────────────────────────────────
@@ -536,7 +551,7 @@ def process_doc_change(doc_record: dict):
     # IST timestamp
     now_utc = datetime.now(timezone.utc)
     now_ist = now_utc + IST_OFFSET
-    edited_at_str = now_ist.strftime("%Y-%m-%d %I:%M %p IST")
+    edited_at_str = now_ist.strftime("%Y-%m-%d %I:%M:%S %p IST")
 
     # Detect image changes
     # We compare inline_object_ids from previous snapshot via DB
