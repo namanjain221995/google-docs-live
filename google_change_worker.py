@@ -484,8 +484,7 @@ def read_doc_txt(prefix: str) -> str:
         return ""
 
 def write_doc_txt(prefix: str, content: str):
-    """Write doc.txt to temp prefix. Also write to final path if already known."""
-    # Always write to temp
+    """Write doc.txt to temp prefix only. Final copy happens at 30-min idle."""
     key = f"{prefix}/doc.txt"
     s3.put_object(
         Bucket=S3_BUCKET,
@@ -493,22 +492,6 @@ def write_doc_txt(prefix: str, content: str):
         Body=content.encode("utf-8"),
         ContentType="text/plain"
     )
-
-    # Also write to final Interview-Success path if already found
-    try:
-        state = read_state_json(prefix)
-        final_prefix = state.get("final_s3_prefix", "")
-        if final_prefix:
-            final_key = f"{final_prefix}/docs/doc.txt"
-            s3.put_object(
-                Bucket=S3_BUCKET,
-                Key=final_key,
-                Body=content.encode("utf-8"),
-                ContentType="text/plain"
-            )
-            log.info(f"Also wrote doc.txt to final path: {final_key}")
-    except Exception as e:
-        log.warning(f"Could not write to final path: {e}")
 
 
 def read_state_json(prefix: str) -> dict:
@@ -654,19 +637,7 @@ CURRENT FINAL CONTENT
 {new_text.strip()}
 """
 
-    # ── Try to find final Interview-Success path if not already known ──
-    state = read_state_json(prefix)
-    if not state.get("final_s3_prefix"):
-        final_prefix = find_final_s3_prefix(meeting_id)
-        if final_prefix:
-            update_state_json(prefix, {
-                "final_s3_prefix": final_prefix,
-                "final_doc_txt":   f"s3://{S3_BUCKET}/{final_prefix}/docs/doc.txt",
-                "final_found_at":  datetime.now(timezone.utc).isoformat()
-            })
-            log.info(f"Final path found and saved to state.json: {final_prefix}")
-
-    # Write doc.txt to temp (and final if known)
+    # Write doc.txt to temp only — final copy happens at 30-min idle
     write_doc_txt(prefix, new_doc_txt)
 
     # Save snapshot to DB
