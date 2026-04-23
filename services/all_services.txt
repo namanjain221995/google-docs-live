@@ -1,0 +1,75 @@
+# ============================================================
+# FILE: services/meeting-start-worker.service
+# Copy to: /etc/systemd/system/meeting-start-worker.service
+# ============================================================
+[Unit]
+Description=Zoom Meeting Start Worker - Google Doc Tracker
+After=network.target postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/doc-ui-worker
+EnvironmentFile=/home/ec2-user/doc-ui-worker/env
+ExecStart=/usr/bin/python3.11 /home/ec2-user/doc-ui-worker/meeting_start_worker.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=meeting-start-worker
+
+[Install]
+WantedBy=multi-user.target
+
+
+# ============================================================
+# FILE: services/google-change-worker.service
+# Copy to: /etc/systemd/system/google-change-worker.service
+# ============================================================
+[Unit]
+Description=Google Doc Change Worker - Live History Tracker
+After=network.target postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/doc-ui-worker
+EnvironmentFile=/home/ec2-user/doc-ui-worker/env
+ExecStart=/usr/bin/python3.11 /home/ec2-user/doc-ui-worker/google_change_worker.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=google-change-worker
+LimitNOFILE=65536
+LimitNPROC=4096
+
+[Install]
+WantedBy=multi-user.target
+
+
+# ============================================================
+# FILE: services/google-watch-manager.service
+# Copy to: /etc/systemd/system/google-watch-manager.service
+# ============================================================
+[Unit]
+Description=Google Watch Manager - Renews file watches every 6 hours
+After=network.target postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/doc-ui-worker
+EnvironmentFile=/home/ec2-user/doc-ui-worker/env
+ExecStart=/usr/bin/python3.11 /home/ec2-user/doc-ui-worker/google_watch_manager.py
+Restart=always
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=google-watch-manager
+
+[Install]
+WantedBy=multi-user.target

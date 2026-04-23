@@ -1,0 +1,19 @@
+[Unit]
+Description=Google Watch Manager - Renews file watches every 6 hours
+After=network.target postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/doc-ui-worker
+EnvironmentFile=/home/ec2-user/doc-ui-worker/env
+ExecStart=/usr/bin/python3.11 /home/ec2-user/doc-ui-worker/google_watch_manager.py
+Restart=always
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=google-watch-manager
+
+[Install]
+WantedBy=multi-user.target

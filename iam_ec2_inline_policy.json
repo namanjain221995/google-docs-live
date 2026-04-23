@@ -1,0 +1,71 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "SQSReceiveDeleteSend",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage",
+        "sqs:GetQueueAttributes",
+        "sqs:SendMessage"
+      ],
+      "Resource": [
+        "arn:aws:sqs:us-east-1:985100584614:zoom-meeting-start-queue",
+        "arn:aws:sqs:us-east-1:985100584614:google-doc-change-queue",
+        "arn:aws:sqs:us-east-1:985100584614:google-doc-history-queue",
+        "arn:aws:sqs:us-east-1:985100584614:zoom-recording-queue"
+      ]
+    },
+    {
+      "Sid": "S3TempAndFinalDocs",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:CopyObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::zoom-automation-bucket",
+        "arn:aws:s3:::zoom-automation-bucket/*"
+      ]
+    },
+    {
+      "Sid": "SecretsManagerReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:DescribeSecret"
+      ],
+      "Resource": [
+        "arn:aws:secretsmanager:us-east-1:985100584614:secret:sf/jwt/credentials*",
+        "arn:aws:secretsmanager:us-east-1:985100584614:secret:google/doc-history-service-account*",
+        "arn:aws:secretsmanager:us-east-1:985100584614:secret:google/service-account*"
+      ]
+    },
+    {
+      "Sid": "CloudWatchLogsWrite",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+        "logs:DescribeLogStreams"
+      ],
+      "Resource": [
+        "arn:aws:logs:us-east-1:985100584614:log-group:/ec2/doc-history-worker*"
+      ]
+    },
+    {
+      "Sid": "EC2DescribeSelf",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeInstances",
+        "ec2:DescribeTags"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
