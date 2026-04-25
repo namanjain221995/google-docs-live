@@ -1,15 +1,13 @@
 """
 doc_finalizer_worker.py
------------------------
 Polls zoom-docs-finalize-queue.
-When recording.completed fires for a meeting:
-  1. Waits 60 seconds for zoom-recording-processor to finish uploading to S3
-  2. Searches S3 for Interview-Success/<...>/<meeting_id>/<...>/ folder
-  3. Copies temp/live-doc-history/<meeting_id>/doc.txt
-     → Interview-Success/<...>/<meeting_id>/<...>/docs/doc.txt
-  4. Creates temp/live-doc-history/<meeting_id>/done.json
-     with final path info
-  5. Marks tracked_doc as finalized in PostgreSQL
+When recording.completed fires:
+  1. Waits 60s for recording processor
+  2. Searches S3 for Interview-Success/<...>/<meeting_id>/ folder
+  3. Finds temp prefix from DB or S3 scan (supports old + new structure)
+  4. Copies doc.txt → Interview-Success/.../docs/doc.txt
+  5. Creates done.json in temp folder
+  6. Marks finalized in PostgreSQL
 """
 
 import os
@@ -22,22 +20,21 @@ import psycopg2
 import psycopg2.extras
 from datetime import datetime, timezone, timedelta
 
-AWS_REGION            = os.environ.get("AWS_REGION", "us-east-1")
-S3_BUCKET             = os.environ.get("S3_BUCKET", "zoom-automation-bucket")
-DOCS_FINALIZE_QUEUE   = os.environ.get("DOCS_FINALIZE_QUEUE_URL",
+AWS_REGION          = os.environ.get("AWS_REGION", "us-east-1")
+S3_BUCKET           = os.environ.get("S3_BUCKET", "zoom-automation-bucket")
+DOCS_FINALIZE_QUEUE = os.environ.get("DOCS_FINALIZE_QUEUE_URL",
     "https://sqs.us-east-1.amazonaws.com/985100584614/zoom-docs-finalize-queue")
-DB_HOST               = os.environ.get("DB_HOST", "127.0.0.1")
-DB_NAME               = os.environ.get("DB_NAME", "dochistory")
-DB_USER               = os.environ.get("DB_USER", "postgres")
-DB_PASS               = os.environ.get("DB_PASS", "")
-DB_PORT               = int(os.environ.get("DB_PORT", "5432"))
-WAIT_BEFORE_SEARCH    = int(os.environ.get("WAIT_BEFORE_SEARCH_SECONDS", "60"))
-IST_OFFSET            = timedelta(hours=5, minutes=30)
+DB_HOST             = os.environ.get("DB_HOST", "127.0.0.1")
+DB_NAME             = os.environ.get("DB_NAME", "dochistory")
+DB_USER             = os.environ.get("DB_USER", "postgres")
+DB_PASS             = os.environ.get("DB_PASS", "DocHistory2026")
+DB_PORT             = int(os.environ.get("DB_PORT", "5432"))
+WAIT_BEFORE_SEARCH  = int(os.environ.get("WAIT_BEFORE_SEARCH_SECONDS", "60"))
+IST_OFFSET          = timedelta(hours=5, minutes=30)
 
-# Departments and their S3 path depth after meeting_id
 DEPARTMENTS = {
-    "Interview-Success": 4,   # MeetingID/Company/Date/Round/Time
-    "Training":          2,   # MeetingID/Date/Time
+    "Interview-Success": 4,
+    "Training":          2,
     "Customer-Success":  2,
     "Marketing":         2,
 }
@@ -65,11 +62,50 @@ def get_db():
     )
 
 
+def get_temp_prefix_from_db(meeting_id: str) -> str | None:
+    """Get temp_s3_prefix stored in DB when meeting started."""
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT temp_s3_prefix FROM tracked_docs WHERE meeting_id=%s LIMIT 1",
+                (meeting_id,))
+            row = cur.fetchone()
+        conn.close()
+        if row and row.get("temp_s3_prefix"):
+            return row["temp_s3_prefix"]
+    except Exception as e:
+        log.warning(f"DB lookup failed for meeting_id={meeting_id}: {e}")
+    return None
+
+
+def find_temp_prefix_from_s3(meeting_id: str) -> str | None:
+    """
+    Search S3 for temp prefix of this meeting.
+    Supports both structures:
+      NEW: temp/live-doc-history/YYYY/Month-M/YYYY-MM-DD/<meeting_id>/
+      OLD: temp/live-doc-history/<meeting_id>/
+    """
+    paginator = s3.get_paginator("list_objects_v2")
+
+    # Try new structure first
+    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix="temp/live-doc-history/"):
+        for obj in page.get("Contents", []):
+            key   = obj["Key"]
+            parts = key.split("/")
+            # NEW: temp/live-doc-history/YYYY/Month-M/YYYY-MM-DD/meeting_id/file
+            if (len(parts) >= 7 and parts[2].isdigit()
+                    and parts[3].startswith("Month-") and parts[5] == meeting_id):
+                return "/".join(parts[:6])
+            # OLD: temp/live-doc-history/meeting_id/file
+            if len(parts) >= 4 and parts[2] == meeting_id:
+                return "/".join(parts[:3])
+    return None
+
+
 def find_final_s3_prefix(meeting_id: str) -> str | None:
-    """Search all departments for the recording folder of this meeting_id."""
     paginator  = s3.get_paginator("list_objects_v2")
     search_str = f"/{meeting_id}/"
-
     for dept, offset in DEPARTMENTS.items():
         found = set()
         try:
@@ -90,36 +126,28 @@ def find_final_s3_prefix(meeting_id: str) -> str | None:
                 log.info(f"Found final S3 prefix [{dept}] for meeting_id={meeting_id}: {result}")
                 return result
         except Exception as e:
-            log.error(f"S3 search error in {dept} for meeting_id={meeting_id}: {e}")
-
-    log.warning(f"No final S3 prefix found for meeting_id={meeting_id}")
+            log.error(f"S3 search error in {dept}: {e}")
     return None
 
 
-def copy_docs_to_final(meeting_id: str, final_prefix: str) -> bool:
-    """Copy doc.txt and images from temp to final Interview-Success path."""
-    temp_prefix = f"temp/live-doc-history/{meeting_id}"
-    docs_prefix = f"{final_prefix}/docs"
-    src_key     = f"{temp_prefix}/doc.txt"
-    dst_key     = f"{docs_prefix}/doc.txt"
-
-    # Check if temp doc.txt exists
+def copy_docs_to_final(meeting_id: str, temp_prefix: str, final_prefix: str) -> bool:
+    src_key = f"{temp_prefix}/doc.txt"
+    dst_key = f"{final_prefix}/docs/doc.txt"
     try:
         s3.head_object(Bucket=S3_BUCKET, Key=src_key)
     except Exception:
-        log.warning(f"No temp doc.txt found for meeting_id={meeting_id} at {src_key}")
+        log.warning(f"No temp doc.txt for meeting_id={meeting_id} at {src_key}")
         return False
-
-    # Read, update S3 location line, write to final
     try:
         obj     = s3.get_object(Bucket=S3_BUCKET, Key=src_key)
         content = obj["Body"].read().decode("utf-8")
         content = content.replace(
-            f"s3://{S3_BUCKET}/{temp_prefix}/doc.txt",
+            f"s3://{S3_BUCKET}/{src_key}",
             f"s3://{S3_BUCKET}/{dst_key}"
         )
-        now_ist      = (datetime.now(timezone.utc) + IST_OFFSET).strftime("%Y-%m-%d %I:%M:%S %p IST")
-        finalized_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        now_utc      = datetime.now(timezone.utc)
+        now_ist      = (now_utc + IST_OFFSET).strftime("%Y-%m-%d %I:%M:%S %p IST")
+        finalized_at = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
         content += (
             f"\n\n==================================================\n"
             f"FINALIZED AT: {finalized_at} ({now_ist})\n"
@@ -129,12 +157,12 @@ def copy_docs_to_final(meeting_id: str, final_prefix: str) -> bool:
             Bucket=S3_BUCKET, Key=dst_key,
             Body=content.encode("utf-8"), ContentType="text/plain"
         )
-        log.info(f"doc.txt copied to final: s3://{S3_BUCKET}/{dst_key}")
+        log.info(f"doc.txt copied → s3://{S3_BUCKET}/{dst_key}")
     except Exception as e:
-        log.error(f"Failed to copy doc.txt for meeting_id={meeting_id}: {e}")
+        log.error(f"Copy failed for meeting_id={meeting_id}: {e}")
         return False
 
-    # Copy images if any
+    # Copy images
     paginator = s3.get_paginator("list_objects_v2")
     try:
         for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=f"{temp_prefix}/images/"):
@@ -143,78 +171,61 @@ def copy_docs_to_final(meeting_id: str, final_prefix: str) -> bool:
                 s3.copy_object(
                     Bucket=S3_BUCKET,
                     CopySource={"Bucket": S3_BUCKET, "Key": obj["Key"]},
-                    Key=f"{docs_prefix}/images/{fname}"
+                    Key=f"{final_prefix}/docs/images/{fname}"
                 )
-                log.info(f"Image copied: {fname}")
-    except Exception as e:
-        log.warning(f"Image copy warning: {e}")
-
+    except Exception:
+        pass
     return True
 
 
-def create_done_json(meeting_id: str, final_prefix: str, msg: dict):
-    """
-    Create done.json in temp folder with full finalization info.
-    This confirms docs were successfully moved to final location.
-    """
+def create_done_json(meeting_id: str, temp_prefix: str, final_prefix: str, msg: dict):
     now_utc = datetime.now(timezone.utc)
-    now_ist = now_utc + IST_OFFSET
-
     done = {
         "meeting_id":       meeting_id,
         "status":           "finalized",
         "finalized_at":     now_utc.isoformat(),
-        "finalized_at_ist": now_ist.strftime("%Y-%m-%d %I:%M:%S %p IST"),
+        "finalized_at_ist": (now_utc + IST_OFFSET).strftime("%Y-%m-%d %I:%M:%S %p IST"),
         "final_s3_prefix":  final_prefix,
         "final_doc_txt":    f"s3://{S3_BUCKET}/{final_prefix}/docs/doc.txt",
-        "temp_prefix":      f"temp/live-doc-history/{meeting_id}",
+        "temp_prefix":      temp_prefix,
         "host_email":       msg.get("host_email", ""),
         "topic":            msg.get("topic", ""),
         "trigger":          "recording.completed",
     }
-
-    key = f"temp/live-doc-history/{meeting_id}/done.json"
     s3.put_object(
-        Bucket=S3_BUCKET, Key=key,
-        Body=json.dumps(done, indent=2), ContentType="application/json"
+        Bucket=S3_BUCKET,
+        Key=f"{temp_prefix}/done.json",
+        Body=json.dumps(done, indent=2),
+        ContentType="application/json"
     )
-    log.info(f"done.json created: s3://{S3_BUCKET}/{key}")
-    return done
+    log.info(f"done.json created at s3://{S3_BUCKET}/{temp_prefix}/done.json")
 
 
 def mark_finalized_in_db(meeting_id: str):
-    """Mark the tracked_doc as finalized in PostgreSQL."""
     try:
         conn = get_db()
         with conn.cursor() as cur:
             cur.execute("""
                 UPDATE tracked_docs SET
-                    status='finalized',
-                    is_active=FALSE,
-                    updated_at=NOW()
+                    status='finalized', is_active=FALSE, updated_at=NOW()
                 WHERE meeting_id=%s
             """, (meeting_id,))
             conn.commit()
         conn.close()
-        log.info(f"Marked meeting_id={meeting_id} as finalized in DB")
+        log.info(f"Marked meeting_id={meeting_id} finalized in DB")
     except Exception as e:
         log.warning(f"DB update failed (non-fatal): {e}")
 
 
-def check_temp_exists(meeting_id: str) -> bool:
-    """Check if we were tracking this meeting at all."""
+def check_already_finalized(meeting_id: str, temp_prefix: str) -> bool:
     try:
-        s3.head_object(
-            Bucket=S3_BUCKET,
-            Key=f"temp/live-doc-history/{meeting_id}/state.json"
-        )
+        s3.head_object(Bucket=S3_BUCKET, Key=f"{temp_prefix}/done.json")
         return True
     except Exception:
         return False
 
 
 def process_finalize_message(msg: dict):
-    """Main logic for one finalization message."""
     meeting_id = str(msg.get("meeting_id", ""))
     if not meeting_id:
         log.warning(f"No meeting_id in finalize message: {msg}")
@@ -222,41 +233,38 @@ def process_finalize_message(msg: dict):
 
     log.info(f"Received finalize trigger for meeting_id={meeting_id}")
 
-    # Check if we were tracking this meeting
-    if not check_temp_exists(meeting_id):
-        log.info(f"meeting_id={meeting_id} was not tracked (no state.json) — skipping")
+    # Get temp prefix — from DB first, then S3 scan
+    temp_prefix = get_temp_prefix_from_db(meeting_id)
+    if not temp_prefix:
+        temp_prefix = find_temp_prefix_from_s3(meeting_id)
+
+    if not temp_prefix:
+        log.info(f"meeting_id={meeting_id} was not tracked — skipping")
         return
 
-    # Check if already finalized
-    try:
-        s3.head_object(
-            Bucket=S3_BUCKET,
-            Key=f"temp/live-doc-history/{meeting_id}/done.json"
-        )
-        log.info(f"meeting_id={meeting_id} already finalized (done.json exists)")
+    # Already finalized?
+    if check_already_finalized(meeting_id, temp_prefix):
+        log.info(f"meeting_id={meeting_id} already finalized")
         return
-    except Exception:
-        pass  # not finalized yet, continue
 
-    # Wait for recording processor to finish uploading to S3
-    log.info(f"Waiting {WAIT_BEFORE_SEARCH}s for recording processor to finish S3 upload...")
+    # Wait for recording processor to finish
+    log.info(f"Waiting {WAIT_BEFORE_SEARCH}s for recording processor...")
     time.sleep(WAIT_BEFORE_SEARCH)
 
-    # Search for final S3 path — retry up to 6 times (10 min total)
+    # Search for final S3 path — retry up to 6 times (2 min each)
     final_prefix = None
     for attempt in range(6):
         final_prefix = find_final_s3_prefix(meeting_id)
         if final_prefix:
             break
-        log.info(f"Attempt {attempt+1}/6: Final path not found yet, waiting 2 min...")
+        log.info(f"Attempt {attempt+1}/6: not found yet, waiting 2 min...")
         time.sleep(120)
 
     if not final_prefix:
         log.error(f"Could not find final S3 path for meeting_id={meeting_id} after 6 attempts")
-        # Create a failed done.json so we don't retry forever
         s3.put_object(
             Bucket=S3_BUCKET,
-            Key=f"temp/live-doc-history/{meeting_id}/done.json",
+            Key=f"{temp_prefix}/done.json",
             Body=json.dumps({
                 "meeting_id": meeting_id,
                 "status": "failed",
@@ -267,57 +275,35 @@ def process_finalize_message(msg: dict):
         )
         return
 
-    # Copy docs to final path
-    success = copy_docs_to_final(meeting_id, final_prefix)
-    if not success:
-        log.warning(f"doc.txt copy failed for meeting_id={meeting_id} — may not have been tracked")
-
-    # Always create done.json
-    create_done_json(meeting_id, final_prefix, msg)
-
-    # Mark finalized in DB
+    copy_docs_to_final(meeting_id, temp_prefix, final_prefix)
+    create_done_json(meeting_id, temp_prefix, final_prefix, msg)
     mark_finalized_in_db(meeting_id)
-
-    log.info(
-        f"FINALIZED meeting_id={meeting_id}\n"
-        f"  doc.txt → s3://{S3_BUCKET}/{final_prefix}/docs/doc.txt\n"
-        f"  done.json → s3://{S3_BUCKET}/temp/live-doc-history/{meeting_id}/done.json"
-    )
+    log.info(f"FINALIZED meeting_id={meeting_id} → {final_prefix}/docs/doc.txt")
 
 
 def main():
     log.info("doc_finalizer_worker starting...")
-    log.info(f"Queue: {DOCS_FINALIZE_QUEUE}")
-    log.info(f"Wait before search: {WAIT_BEFORE_SEARCH}s")
-
     while True:
         try:
             resp = sqs.receive_message(
                 QueueUrl=DOCS_FINALIZE_QUEUE,
                 MaxNumberOfMessages=5,
                 WaitTimeSeconds=20,
-                VisibilityTimeout=600  # 10 min — enough for retries
+                VisibilityTimeout=600
             )
             messages = resp.get("Messages", [])
             if not messages:
                 continue
-
             for msg in messages:
                 receipt = msg["ReceiptHandle"]
                 try:
                     body = json.loads(msg["Body"])
-                    # Handle SNS wrapper if present
                     if "Message" in body:
                         body = json.loads(body["Message"])
-
                     process_finalize_message(body)
-                    sqs.delete_message(
-                        QueueUrl=DOCS_FINALIZE_QUEUE,
-                        ReceiptHandle=receipt
-                    )
+                    sqs.delete_message(QueueUrl=DOCS_FINALIZE_QUEUE, ReceiptHandle=receipt)
                 except Exception as e:
-                    log.error(f"Error processing finalize message: {e}", exc_info=True)
-
+                    log.error(f"Error processing message: {e}", exc_info=True)
         except Exception as e:
             log.error(f"Outer loop error: {e}", exc_info=True)
             time.sleep(10)

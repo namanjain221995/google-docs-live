@@ -1,12 +1,11 @@
 """
 retry_unfinalized.py
---------------------
 Finds all meetings in temp/live-doc-history/ that:
   1. Have state.json (were tracked)
   2. Do NOT have done.json (not finalized yet)
-Then tries to finalize them using 50 parallel workers.
-
-Run manually or on a cron schedule.
+Tries to finalize them using 20 parallel workers.
+Supports both old flat structure and new date-organized structure.
+Run via systemd timer every 10 minutes.
 """
 
 import os
@@ -25,7 +24,7 @@ S3_BUCKET   = os.environ.get("S3_BUCKET", "zoom-automation-bucket")
 DB_HOST     = os.environ.get("DB_HOST", "127.0.0.1")
 DB_NAME     = os.environ.get("DB_NAME", "dochistory")
 DB_USER     = os.environ.get("DB_USER", "postgres")
-DB_PASS     = os.environ.get("DB_PASS", "")
+DB_PASS     = os.environ.get("DB_PASS", "DocHistory2026")
 DB_PORT     = int(os.environ.get("DB_PORT", "5432"))
 IST_OFFSET  = timedelta(hours=5, minutes=30)
 MAX_WORKERS = 20
@@ -55,36 +54,62 @@ def get_db():
     )
 
 
-def find_unfinalized_meetings() -> list[str]:
-    """Find all meeting_ids that have state.json but no done.json (within last 2 hours)."""
+def find_unfinalized_meetings() -> list[dict]:
+    """
+    Scan temp/live-doc-history/ for meetings with state.json but no done.json.
+    Supports both structures:
+      OLD: temp/live-doc-history/<meeting_id>/state.json
+      NEW: temp/live-doc-history/<YYYY>/<Month-M>/<YYYY-MM-DD>/<meeting_id>/state.json
+    Returns list of dicts: {meeting_id, prefix}
+    """
     log.info("Scanning temp/live-doc-history/ for unfinalized meetings...")
-    paginator    = s3.get_paginator("list_objects_v2")
-    has_state    = set()
-    has_done     = set()
-    state_times  = {}  # meeting_id -> last_modified
+    paginator  = s3.get_paginator("list_objects_v2")
+    state_map  = {}   # meeting_id -> prefix
+    done_set   = set()
 
     for page in paginator.paginate(Bucket=S3_BUCKET, Prefix="temp/live-doc-history/"):
         for obj in page.get("Contents", []):
             key   = obj["Key"]
             parts = key.split("/")
-            # temp/live-doc-history/<meeting_id>/state.json
-            if len(parts) >= 4:
-                meeting_id = parts[2]
-                filename   = parts[3] if len(parts) > 3 else ""
-                if filename == "state.json":
-                    has_state.add(meeting_id)
-                elif filename == "done.json":
-                    has_done.add(meeting_id)
+            # parts[0]=temp, parts[1]=live-doc-history
 
-    unfinalized = sorted(has_state - has_done)
-    log.info(f"Found {len(has_state)} tracked meetings, {len(has_done)} finalized, {len(unfinalized)} need retry")
+            # NEW structure: temp/live-doc-history/YYYY/Month-M/YYYY-MM-DD/meeting_id/file
+            if len(parts) == 7 and parts[2].isdigit() and parts[3].startswith("Month-"):
+                meeting_id = parts[5]
+                prefix     = "/".join(parts[:6])
+                filename   = parts[6]
+                if filename == "state.json":
+                    state_map[meeting_id] = prefix
+                elif filename == "done.json":
+                    done_set.add(meeting_id)
+
+            # OLD structure: temp/live-doc-history/meeting_id/file
+            elif len(parts) == 4 and parts[2].isdigit():
+                meeting_id = parts[2]
+                prefix     = "/".join(parts[:3])
+                filename   = parts[3]
+                if filename == "state.json":
+                    if meeting_id not in state_map:
+                        state_map[meeting_id] = prefix
+                elif filename == "done.json":
+                    done_set.add(meeting_id)
+
+    unfinalized = [
+        {"meeting_id": mid, "prefix": pfx}
+        for mid, pfx in state_map.items()
+        if mid not in done_set
+    ]
+    log.info(
+        f"Found {len(state_map)} tracked, "
+        f"{len(done_set)} finalized, "
+        f"{len(unfinalized)} need retry"
+    )
     return unfinalized
 
 
 def find_final_s3_prefix(meeting_id: str) -> str | None:
     paginator  = s3.get_paginator("list_objects_v2")
     search_str = f"/{meeting_id}/"
-
     for dept, offset in DEPARTMENTS.items():
         found = set()
         try:
@@ -107,27 +132,24 @@ def find_final_s3_prefix(meeting_id: str) -> str | None:
     return None
 
 
-def copy_docs_to_final(meeting_id: str, final_prefix: str) -> bool:
-    temp_prefix = f"temp/live-doc-history/{meeting_id}"
-    docs_prefix = f"{final_prefix}/docs"
-    src_key     = f"{temp_prefix}/doc.txt"
-    dst_key     = f"{docs_prefix}/doc.txt"
-
+def copy_docs_to_final(meeting_id: str, temp_prefix: str, final_prefix: str) -> bool:
+    src_key = f"{temp_prefix}/doc.txt"
+    dst_key = f"{final_prefix}/docs/doc.txt"
     try:
         s3.head_object(Bucket=S3_BUCKET, Key=src_key)
     except Exception:
-        log.warning(f"[{meeting_id}] No doc.txt found in temp")
+        log.warning(f"[{meeting_id}] No doc.txt at {src_key}")
         return False
-
     try:
         obj     = s3.get_object(Bucket=S3_BUCKET, Key=src_key)
         content = obj["Body"].read().decode("utf-8")
         content = content.replace(
-            f"s3://{S3_BUCKET}/{temp_prefix}/doc.txt",
+            f"s3://{S3_BUCKET}/{src_key}",
             f"s3://{S3_BUCKET}/{dst_key}"
         )
-        now_ist      = (datetime.now(timezone.utc) + IST_OFFSET).strftime("%Y-%m-%d %I:%M:%S %p IST")
-        finalized_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        now_utc      = datetime.now(timezone.utc)
+        now_ist      = (now_utc + IST_OFFSET).strftime("%Y-%m-%d %I:%M:%S %p IST")
+        finalized_at = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
         content += (
             f"\n\n==================================================\n"
             f"FINALIZED AT: {finalized_at} ({now_ist})\n"
@@ -144,7 +166,7 @@ def copy_docs_to_final(meeting_id: str, final_prefix: str) -> bool:
         return False
 
 
-def create_done_json(meeting_id: str, final_prefix: str):
+def create_done_json(meeting_id: str, temp_prefix: str, final_prefix: str):
     now_utc = datetime.now(timezone.utc)
     done = {
         "meeting_id":       meeting_id,
@@ -153,11 +175,12 @@ def create_done_json(meeting_id: str, final_prefix: str):
         "finalized_at_ist": (now_utc + IST_OFFSET).strftime("%Y-%m-%d %I:%M:%S %p IST"),
         "final_s3_prefix":  final_prefix,
         "final_doc_txt":    f"s3://{S3_BUCKET}/{final_prefix}/docs/doc.txt",
+        "temp_prefix":      temp_prefix,
         "trigger":          "retry_unfinalized",
     }
     s3.put_object(
         Bucket=S3_BUCKET,
-        Key=f"temp/live-doc-history/{meeting_id}/done.json",
+        Key=f"{temp_prefix}/done.json",
         Body=json.dumps(done, indent=2),
         ContentType="application/json"
     )
@@ -178,14 +201,16 @@ def mark_finalized_in_db(meeting_id: str):
         log.warning(f"[{meeting_id}] DB update failed: {e}")
 
 
-def process_one(meeting_id: str) -> str:
-    """Process a single meeting_id. Returns status string."""
+def process_one(item: dict) -> str:
+    meeting_id  = item["meeting_id"]
+    temp_prefix = item["prefix"]
+
     final_prefix = find_final_s3_prefix(meeting_id)
     if not final_prefix:
-        return f"SKIP  {meeting_id} — recording folder not in S3 yet"
+        return f"SKIP  {meeting_id} — recording not in S3 yet"
 
-    success = copy_docs_to_final(meeting_id, final_prefix)
-    create_done_json(meeting_id, final_prefix)
+    success = copy_docs_to_final(meeting_id, temp_prefix, final_prefix)
+    create_done_json(meeting_id, temp_prefix, final_prefix)
     mark_finalized_in_db(meeting_id)
 
     if success:
@@ -196,19 +221,18 @@ def process_one(meeting_id: str) -> str:
 
 def main():
     log.info("=== retry_unfinalized starting ===")
-    meeting_ids = find_unfinalized_meetings()
+    items = find_unfinalized_meetings()
 
-    if not meeting_ids:
+    if not items:
         log.info("Nothing to retry. All tracked meetings are finalized.")
         return
 
-    log.info(f"Retrying {len(meeting_ids)} meetings with {MAX_WORKERS} parallel workers...")
-
-    results  = {"ok": 0, "skip": 0, "done": 0, "error": 0}
-    skipped  = []
+    log.info(f"Retrying {len(items)} meetings with {MAX_WORKERS} parallel workers...")
+    results = {"ok": 0, "skip": 0, "done": 0, "error": 0}
+    skipped = []
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="retry") as executor:
-        futures = {executor.submit(process_one, mid): mid for mid in meeting_ids}
+        futures = {executor.submit(process_one, item): item["meeting_id"] for item in items}
         for future in as_completed(futures):
             mid = futures[future]
             try:
@@ -227,14 +251,11 @@ def main():
 
     log.info(f"""
 === retry_unfinalized complete ===
-  Finalized:       {results['ok']}
-  No doc.txt:      {results['done']}
-  Still skipped:   {results['skip']} (recording not in S3 yet)
-  Errors:          {results['error']}
+  Finalized:     {results['ok']}
+  No doc.txt:    {results['done']}
+  Still skipped: {results['skip']} (recording not in S3 yet)
+  Errors:        {results['error']}
 """)
-
-    if skipped:
-        log.info(f"Still skipped (run again later): {skipped[:10]}{'...' if len(skipped)>10 else ''}")
 
 
 if __name__ == "__main__":

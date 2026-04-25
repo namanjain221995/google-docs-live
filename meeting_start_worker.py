@@ -3,10 +3,11 @@ meeting_start_worker.py
 Polls zoom-meeting-start-queue.
 On meeting.started:
   1. Extract meeting_id
-  2. Lookup Salesforce Interview__c by Zoom_Meeting_Id__c
-  3. Get Google_Docs_ID__c + Google_Docs_URL__c
+  2. Lookup Salesforce Interview__c
+  3. Get Google Doc ID + URL
   4. Register files.watch on Google Doc
   5. Create temp S3 state.json + doc.txt
+     Path: temp/live-doc-history/<YYYY>/<Month-M>/<YYYY-MM-DD>/<meeting_id>/
   6. Insert into PostgreSQL tracked_docs
 """
 
@@ -62,11 +63,9 @@ sqs = boto3.client("sqs", region_name=AWS_REGION)
 s3  = boto3.client("s3",  region_name=AWS_REGION)
 sm  = boto3.client("secretsmanager", region_name=AWS_REGION)
 
-# ── SECRETS ──
 def get_secret(name):
     return json.loads(sm.get_secret_value(SecretId=name)["SecretString"])
 
-# ── DB ──
 def get_db():
     return psycopg2.connect(
         host=DB_HOST, dbname=DB_NAME, user=DB_USER,
@@ -76,7 +75,6 @@ def get_db():
 
 # ── SALESFORCE ──
 _sf_client = None
-
 def get_sf():
     global _sf_client
     if _sf_client:
@@ -93,9 +91,6 @@ def get_sf():
 
 def lookup_salesforce(meeting_id):
     sf = get_sf()
-    # VERIFIED CORRECT field names from Interview__c describe:
-    # Company__c (NOT Company_Name__c)
-    # Interviewer_s_Name__c (NOT Host_Name__c)
     query = f"""
         SELECT Id, Name, Zoom_Meeting_Id__c,
                Google_Docs_ID__c, Google_Docs_URL__c,
@@ -109,21 +104,19 @@ def lookup_salesforce(meeting_id):
     result  = sf.query(query)
     records = result.get("records", [])
     if not records:
-        log.warning(f"No Salesforce record found for meeting_id={meeting_id}")
+        log.warning(f"No Salesforce record for meeting_id={meeting_id}")
         return None
     return records[0]
 
 # ── GOOGLE AUTH ──
 _google_creds = None
-
 def get_google_creds():
     global _google_creds
     if _google_creds:
         return _google_creds
     secret        = get_secret(GOOGLE_SECRET_NAME)
     _google_creds = service_account.Credentials.from_service_account_info(
-        secret, scopes=GOOGLE_SCOPES
-    )
+        secret, scopes=GOOGLE_SCOPES)
     return _google_creds
 
 def get_drive_service():
@@ -135,27 +128,38 @@ def register_file_watch(doc_id, meeting_id):
     channel_id = str(uuid.uuid4())
     expiry_ms  = int((time.time() + 6 * 24 * 3600) * 1000)
     body = {
-        "id":         channel_id,
-        "type":       "web_hook",
-        "address":    GOOGLE_WEBHOOK_URL,
+        "id": channel_id, "type": "web_hook",
+        "address": GOOGLE_WEBHOOK_URL,
         "expiration": expiry_ms,
-        "params":     {"meeting_id": meeting_id}
+        "params": {"meeting_id": meeting_id}
     }
     try:
         response = drive.files().watch(fileId=doc_id, body=body).execute()
-        log.info(f"Watch registered doc_id={doc_id} meeting_id={meeting_id} channel={channel_id}")
+        log.info(f"Watch registered doc_id={doc_id} meeting_id={meeting_id}")
         return {
             "channel_id":  channel_id,
             "resource_id": response.get("resourceId"),
             "expiry_ms":   expiry_ms
         }
     except Exception as e:
-        log.error(f"Failed to register watch doc_id={doc_id}: {e}")
+        log.error(f"Watch registration failed doc_id={doc_id}: {e}")
         return None
+
+# ── TEMP PATH BUILDER ──
+def build_temp_prefix(meeting_id: str, now_utc: datetime) -> str:
+    """
+    Build organized temp path:
+    temp/live-doc-history/<YYYY>/<Month-M>/<YYYY-MM-DD>/<meeting_id>/
+    Example:
+    temp/live-doc-history/2026/Month-4/2026-04-25/96329841200/
+    """
+    year     = now_utc.strftime("%Y")
+    month    = f"Month-{int(now_utc.strftime('%m'))}"
+    date_str = now_utc.strftime("%Y-%m-%d")
+    return f"temp/live-doc-history/{year}/{month}/{date_str}/{meeting_id}"
 
 # ── S3: FIND FINAL PATH ──
 def find_final_s3_prefix_early(meeting_id):
-    """Search S3 for existing recording folder at meeting start time."""
     DEPARTMENTS = {
         "Interview-Success": 4,
         "Training":          2,
@@ -189,15 +193,16 @@ def find_final_s3_prefix_early(meeting_id):
 
 # ── S3: CREATE TEMP STATE ──
 def create_temp_s3_state(meeting_id, sf_record, doc_id, doc_url):
-    prefix    = f"temp/live-doc-history/{meeting_id}"
+    now_utc   = datetime.now(timezone.utc)
+    now_ist   = now_utc + IST_OFFSET
+    prefix    = build_temp_prefix(meeting_id, now_utc)
+
     candidate = sf_record.get("Candidate_Name__c") or sf_record.get("Name") or "Unknown"
     company   = sf_record.get("Company__c") or "Unknown"
     host_name = (sf_record.get("Interviewer_s_Name__c")
                  or sf_record.get("Interviewer_s_Email__c")
-                 or sf_record.get("Recruiter_Name__c")
-                 or "Unknown")
-    now_utc       = datetime.now(timezone.utc)
-    now_ist_str   = (now_utc + IST_OFFSET).strftime("%Y-%m-%d %I:%M:%S %p IST")
+                 or sf_record.get("Recruiter_Name__c") or "Unknown")
+
     final_prefix  = find_final_s3_prefix_early(meeting_id)
     final_doc_txt = f"s3://{S3_BUCKET}/{final_prefix}/docs/doc.txt" if final_prefix else ""
 
@@ -214,7 +219,7 @@ def create_temp_s3_state(meeting_id, sf_record, doc_id, doc_url):
         "final_doc_txt":        final_doc_txt,
         "status":               "active",
         "initialized_at":       now_utc.isoformat(),
-        "initialized_at_ist":   now_ist_str,
+        "initialized_at_ist":   now_ist.strftime("%Y-%m-%d %I:%M:%S %p IST"),
     }
     s3.put_object(
         Bucket=S3_BUCKET, Key=f"{prefix}/state.json",
@@ -253,8 +258,7 @@ def upsert_tracked_doc(conn, meeting_id, doc_id, doc_url, sf_record, temp_prefix
     company   = sf_record.get("Company__c") or "Unknown"
     host_name = (sf_record.get("Interviewer_s_Name__c")
                  or sf_record.get("Interviewer_s_Email__c")
-                 or sf_record.get("Recruiter_Name__c")
-                 or "Unknown")
+                 or sf_record.get("Recruiter_Name__c") or "Unknown")
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO tracked_docs
@@ -263,20 +267,15 @@ def upsert_tracked_doc(conn, meeting_id, doc_id, doc_url, sf_record, temp_prefix
                  status, is_active, last_change_at)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'active',TRUE,NOW())
             ON CONFLICT (meeting_id) DO UPDATE SET
-                doc_id=EXCLUDED.doc_id,
-                doc_url=EXCLUDED.doc_url,
+                doc_id=EXCLUDED.doc_id, doc_url=EXCLUDED.doc_url,
                 salesforce_record_id=EXCLUDED.salesforce_record_id,
-                candidate=EXCLUDED.candidate,
-                company=EXCLUDED.company,
+                candidate=EXCLUDED.candidate, company=EXCLUDED.company,
                 host_name=EXCLUDED.host_name,
                 temp_s3_prefix=EXCLUDED.temp_s3_prefix,
-                status='active',
-                is_active=TRUE,
-                last_change_at=NOW(),
-                updated_at=NOW()
+                status='active', is_active=TRUE,
+                last_change_at=NOW(), updated_at=NOW()
         """, (meeting_id, doc_id, doc_url, sf_record.get("Id"),
               candidate, company, host_name, temp_prefix))
-
         if watch_info:
             expiry_ts = datetime.fromtimestamp(
                 watch_info["expiry_ms"] / 1000, tz=timezone.utc)
@@ -321,7 +320,7 @@ def process_message(body, conn):
     watch_info  = register_file_watch(doc_id, meeting_id)
     temp_prefix = create_temp_s3_state(meeting_id, sf_record, doc_id, doc_url)
     upsert_tracked_doc(conn, meeting_id, doc_id, doc_url, sf_record, temp_prefix, watch_info)
-    log.info(f"Successfully initialized doc tracking meeting_id={meeting_id} doc_id={doc_id}")
+    log.info(f"Successfully initialized doc tracking meeting_id={meeting_id}")
 
 # ── MAIN ──
 def main():
