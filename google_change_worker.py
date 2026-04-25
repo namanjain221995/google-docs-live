@@ -85,81 +85,114 @@ def get_drive_service():
 def get_docs_service():
     return build("docs", "v1", credentials=get_google_creds(), cache_discovery=False)
 
-# ── DB (per-thread connections) ──
-_thread_local = threading.local()
+# ── DB: Single connection with lock (thread-safe, no pool exhaustion) ──
+_db_conn      = None
+_db_conn_lock = threading.Lock()
 
 def get_db():
-    if not hasattr(_thread_local, "conn") or _thread_local.conn.closed:
-        _thread_local.conn = psycopg2.connect(
-            host=DB_HOST, dbname=DB_NAME, user=DB_USER,
-            password=DB_PASS, port=DB_PORT,
-            cursor_factory=psycopg2.extras.RealDictCursor
-        )
-    return _thread_local.conn
+    """
+    Returns the shared DB connection, reconnecting if needed.
+    Uses a lock so only one thread executes a DB call at a time.
+    This is safe because DB calls are fast (microseconds).
+    """
+    global _db_conn
+    with _db_conn_lock:
+        try:
+            if _db_conn is None or _db_conn.closed:
+                _db_conn = psycopg2.connect(
+                    host=DB_HOST, dbname=DB_NAME, user=DB_USER,
+                    password=DB_PASS, port=DB_PORT,
+                    cursor_factory=psycopg2.extras.RealDictCursor
+                )
+            return _db_conn
+        except Exception as e:
+            _db_conn = psycopg2.connect(
+                host=DB_HOST, dbname=DB_NAME, user=DB_USER,
+                password=DB_PASS, port=DB_PORT,
+                cursor_factory=psycopg2.extras.RealDictCursor
+            )
+            return _db_conn
+
+def db_execute(query, params=None, fetch="none"):
+    """
+    Thread-safe DB execution with automatic retry.
+    fetch: "one", "all", or "none"
+    """
+    global _db_conn
+    for attempt in range(3):
+        try:
+            with _db_conn_lock:
+                if _db_conn is None or _db_conn.closed:
+                    _db_conn = psycopg2.connect(
+                        host=DB_HOST, dbname=DB_NAME, user=DB_USER,
+                        password=DB_PASS, port=DB_PORT,
+                        cursor_factory=psycopg2.extras.RealDictCursor
+                    )
+                with _db_conn.cursor() as cur:
+                    cur.execute(query, params)
+                    if fetch == "one":
+                        return cur.fetchone()
+                    elif fetch == "all":
+                        return cur.fetchall()
+                    else:
+                        _db_conn.commit()
+                        return None
+        except psycopg2.OperationalError:
+            _db_conn = None
+            time.sleep(0.1)
+        except Exception as e:
+            try:
+                _db_conn.rollback()
+            except Exception:
+                _db_conn = None
+            if attempt == 2:
+                raise
+    return None
+
+def release_db(conn):
+    pass  # no-op, single connection stays open
 
 def get_tracked_doc_by_doc_id(doc_id):
-    conn = get_db()
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT * FROM tracked_docs WHERE doc_id=%s AND is_active=TRUE LIMIT 1",
-            (doc_id,))
-        return cur.fetchone()
+    return db_execute(
+        "SELECT * FROM tracked_docs WHERE doc_id=%s AND is_active=TRUE LIMIT 1",
+        (doc_id,), fetch="one")
 
 def get_all_active_docs():
-    conn = get_db()
-    with conn.cursor() as cur:
-        cur.execute("SELECT * FROM tracked_docs WHERE is_active=TRUE AND status='active'")
-        return cur.fetchall()
+    return db_execute(
+        "SELECT * FROM tracked_docs WHERE is_active=TRUE AND status='active'",
+        fetch="all") or []
 
 def update_last_change(meeting_id):
-    conn = get_db()
-    with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE tracked_docs SET last_change_at=NOW(), status='active', updated_at=NOW() WHERE meeting_id=%s",
-            (meeting_id,))
-        conn.commit()
+    db_execute(
+        "UPDATE tracked_docs SET last_change_at=NOW(), status='active', updated_at=NOW() WHERE meeting_id=%s",
+        (meeting_id,))
 
 def get_next_version(meeting_id, doc_id):
-    conn = get_db()
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT COALESCE(MAX(version_number),0) AS coalesce FROM doc_snapshots WHERE meeting_id=%s AND doc_id=%s",
-            (meeting_id, doc_id))
-        row = cur.fetchone()
-        return (row["coalesce"] if row and row["coalesce"] is not None else 0) + 1
+    row = db_execute(
+        "SELECT COALESCE(MAX(version_number),0) AS coalesce FROM doc_snapshots WHERE meeting_id=%s AND doc_id=%s",
+        (meeting_id, doc_id), fetch="one")
+    return (row["coalesce"] if row and row["coalesce"] is not None else 0) + 1
 
 def save_snapshot(meeting_id, doc_id, version, content, edited_by):
-    conn = get_db()
-    with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO doc_snapshots (meeting_id,doc_id,version_number,content_text,edited_by) VALUES (%s,%s,%s,%s,%s)",
-            (meeting_id, doc_id, version, content, edited_by))
-        conn.commit()
+    db_execute(
+        "INSERT INTO doc_snapshots (meeting_id,doc_id,version_number,content_text,edited_by) VALUES (%s,%s,%s,%s,%s)",
+        (meeting_id, doc_id, version, content, edited_by))
 
 def get_last_snapshot_content(meeting_id, doc_id):
-    conn = get_db()
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT content_text FROM doc_snapshots WHERE meeting_id=%s AND doc_id=%s ORDER BY version_number DESC LIMIT 1",
-            (meeting_id, doc_id))
-        row = cur.fetchone()
-        return row["content_text"] if row else None
+    row = db_execute(
+        "SELECT content_text FROM doc_snapshots WHERE meeting_id=%s AND doc_id=%s ORDER BY version_number DESC LIMIT 1",
+        (meeting_id, doc_id), fetch="one")
+    return row["content_text"] if row else None
 
 def mark_doc_idle_in_db(meeting_id):
-    conn = get_db()
-    with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE tracked_docs SET status='idle', updated_at=NOW() WHERE meeting_id=%s",
-            (meeting_id,))
-        conn.commit()
+    db_execute(
+        "UPDATE tracked_docs SET status='idle', updated_at=NOW() WHERE meeting_id=%s",
+        (meeting_id,))
 
 def mark_doc_finalized_in_db(meeting_id):
-    conn = get_db()
-    with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE tracked_docs SET status='finalized', is_active=FALSE, updated_at=NOW() WHERE meeting_id=%s",
-            (meeting_id,))
-        conn.commit()
+    db_execute(
+        "UPDATE tracked_docs SET status='finalized', is_active=FALSE, updated_at=NOW() WHERE meeting_id=%s",
+        (meeting_id,))
 
 # ── S3 HELPERS ──
 def read_doc_txt(prefix):
@@ -290,14 +323,9 @@ def idle_retry_loop():
     while True:
         time.sleep(RETRY_INTERVAL)
         try:
-            conn = get_db()
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT meeting_id FROM tracked_docs
-                    WHERE status='idle' AND is_active=TRUE
-                      AND updated_at > NOW() - INTERVAL '6 hours'
-                """)
-                idle_docs = cur.fetchall()
+            idle_docs = db_execute(
+                "SELECT meeting_id FROM tracked_docs WHERE status='idle' AND is_active=TRUE AND updated_at > NOW() - INTERVAL '6 hours'",
+                fetch="all") or []
 
             if idle_docs:
                 log.info(f"Idle retry: checking {len(idle_docs)} idle docs")
@@ -423,14 +451,12 @@ def compute_diff(old_text, new_text):
 def process_doc_change(doc_record):
     meeting_id = doc_record["meeting_id"]
     doc_id     = doc_record["doc_id"]
-    doc_url    = doc_record.get("doc_url", "")
-    candidate  = doc_record.get("candidate", "Unknown")
-    company    = doc_record.get("company", "Unknown")
     prefix     = doc_record.get("temp_s3_prefix", f"temp/live-doc-history/{meeting_id}")
 
     log.info(f"Processing change for meeting_id={meeting_id} doc_id={doc_id}")
 
-    new_text, new_images = extract_text_from_doc(doc_id)
+    # Fetch current doc content via Docs API (no cache delay)
+    new_text, _ = extract_text_from_doc(doc_id)
     if not new_text.strip():
         log.info(f"Empty doc content for doc_id={doc_id}, skipping")
         return
@@ -439,7 +465,7 @@ def process_doc_change(doc_record):
     added, removed = compute_diff(old_text, new_text)
 
     if not added and not removed and old_text:
-        log.info(f"No text change detected for doc_id={doc_id}, skipping")
+        log.info(f"No text change for doc_id={doc_id}, skipping")
         return
 
     edited_by     = get_last_editor(doc_id)
@@ -468,7 +494,7 @@ def process_doc_change(doc_record):
 
     version_block += f"\nCURRENT SNAPSHOT:\n{new_text.strip()}\n"
 
-    existing      = read_doc_txt(prefix)
+    existing = read_doc_txt(prefix)
     if version == 1 and "TRACKING INITIALIZED" in existing:
         header_end = existing.find("==================================================\nTRACKING INITIALIZED")
         if header_end != -1:
@@ -515,7 +541,17 @@ def worker_loop(doc_id, meeting_id):
             try:
                 doc_record = get_tracked_doc_by_doc_id(doc_id)
                 if doc_record and doc_record["is_active"]:
+                    # Process immediately
                     process_doc_change(doc_record)
+                    # Then poll 3 more times at 30-sec intervals
+                    # to catch rapid successive edits Google may batch
+                    for _ in range(3):
+                        time.sleep(30)
+                        with _workers_lock:
+                            still_pending = _active_workers.get(doc_id, {}).get("pending", False)
+                        if still_pending:
+                            break  # new signal arrived, handle normally
+                        process_doc_change(doc_record)
                 else:
                     log.info(f"doc_id={doc_id} no longer active, worker exiting")
                     with _workers_lock:
@@ -563,15 +599,12 @@ def parse_change_message(msg_body, msg_attributes=None):
 
     if not doc_id and channel_id:
         try:
-            conn = get_db()
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT doc_id FROM doc_watch_state WHERE watch_channel_id=%s LIMIT 1",
-                    (channel_id,))
-                row = cur.fetchone()
-                if row:
-                    doc_id = row["doc_id"]
-                    log.info(f"Resolved doc_id={doc_id} from channel_id={channel_id}")
+            row = db_execute(
+                "SELECT doc_id FROM doc_watch_state WHERE watch_channel_id=%s LIMIT 1",
+                (channel_id,), fetch="one")
+            if row:
+                doc_id = row["doc_id"]
+                log.info(f"Resolved doc_id={doc_id} from channel_id={channel_id}")
         except Exception as e:
             log.warning(f"DB channel lookup failed: {e}")
 

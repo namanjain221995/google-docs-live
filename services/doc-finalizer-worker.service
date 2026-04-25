@@ -1,0 +1,19 @@
+[Unit]
+Description=Doc Finalizer Worker - Copies docs.txt to final S3 path on meeting end
+After=network.target postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/google-docs-live
+EnvironmentFile=/home/ec2-user/google-docs-live/env
+ExecStart=/usr/bin/python3.11 /home/ec2-user/google-docs-live/doc_finalizer_worker.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=doc-finalizer-worker
+
+[Install]
+WantedBy=multi-user.target

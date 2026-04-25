@@ -1,0 +1,373 @@
+2026-04-24 21:33:29,213 [INFO] Found credentials from IAM Role: transcript-ec2-role
+2026-04-24 21:33:29,333 [INFO] doc_finalizer_worker starting...
+2026-04-24 21:33:29,333 [INFO] Queue: https://sqs.us-east-1.amazonaws.com/985100584614/zoom-docs-finalize-queue
+2026-04-24 21:33:29,333 [INFO] Wait before search: 60s
+2026-04-24 21:33:29,370 [ERROR] Outer loop error: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+Traceback (most recent call last):
+  File "/home/ec2-user/google-docs-live/doc_finalizer_worker.py", line 295, in main
+    resp = sqs.receive_message(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 606, in _api_call
+    return self._make_api_call(operation_name, kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/context.py", line 123, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 1094, in _make_api_call
+    raise error_class(parsed_response, operation_name)
+botocore.exceptions.ClientError: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+2026-04-24 21:33:39,405 [ERROR] Outer loop error: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+Traceback (most recent call last):
+  File "/home/ec2-user/google-docs-live/doc_finalizer_worker.py", line 295, in main
+    resp = sqs.receive_message(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 606, in _api_call
+    return self._make_api_call(operation_name, kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/context.py", line 123, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 1094, in _make_api_call
+    raise error_class(parsed_response, operation_name)
+botocore.exceptions.ClientError: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+2026-04-24 21:33:49,440 [ERROR] Outer loop error: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+Traceback (most recent call last):
+  File "/home/ec2-user/google-docs-live/doc_finalizer_worker.py", line 295, in main
+    resp = sqs.receive_message(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 606, in _api_call
+    return self._make_api_call(operation_name, kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/context.py", line 123, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 1094, in _make_api_call
+    raise error_class(parsed_response, operation_name)
+botocore.exceptions.ClientError: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+2026-04-24 21:33:59,477 [ERROR] Outer loop error: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+Traceback (most recent call last):
+  File "/home/ec2-user/google-docs-live/doc_finalizer_worker.py", line 295, in main
+    resp = sqs.receive_message(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 606, in _api_call
+    return self._make_api_call(operation_name, kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/context.py", line 123, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 1094, in _make_api_call
+    raise error_class(parsed_response, operation_name)
+botocore.exceptions.ClientError: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+2026-04-24 21:34:09,515 [ERROR] Outer loop error: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+Traceback (most recent call last):
+  File "/home/ec2-user/google-docs-live/doc_finalizer_worker.py", line 295, in main
+    resp = sqs.receive_message(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 606, in _api_call
+    return self._make_api_call(operation_name, kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/context.py", line 123, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 1094, in _make_api_call
+    raise error_class(parsed_response, operation_name)
+botocore.exceptions.ClientError: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+2026-04-24 21:34:19,545 [ERROR] Outer loop error: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+Traceback (most recent call last):
+  File "/home/ec2-user/google-docs-live/doc_finalizer_worker.py", line 295, in main
+    resp = sqs.receive_message(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 606, in _api_call
+    return self._make_api_call(operation_name, kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/context.py", line 123, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 1094, in _make_api_call
+    raise error_class(parsed_response, operation_name)
+botocore.exceptions.ClientError: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+2026-04-24 21:34:29,580 [ERROR] Outer loop error: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+Traceback (most recent call last):
+  File "/home/ec2-user/google-docs-live/doc_finalizer_worker.py", line 295, in main
+    resp = sqs.receive_message(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 606, in _api_call
+    return self._make_api_call(operation_name, kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/context.py", line 123, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 1094, in _make_api_call
+    raise error_class(parsed_response, operation_name)
+botocore.exceptions.ClientError: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+2026-04-24 21:34:39,613 [ERROR] Outer loop error: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+Traceback (most recent call last):
+  File "/home/ec2-user/google-docs-live/doc_finalizer_worker.py", line 295, in main
+    resp = sqs.receive_message(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 606, in _api_call
+    return self._make_api_call(operation_name, kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/context.py", line 123, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 1094, in _make_api_call
+    raise error_class(parsed_response, operation_name)
+botocore.exceptions.ClientError: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+2026-04-24 21:34:49,647 [ERROR] Outer loop error: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+Traceback (most recent call last):
+  File "/home/ec2-user/google-docs-live/doc_finalizer_worker.py", line 295, in main
+    resp = sqs.receive_message(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 606, in _api_call
+    return self._make_api_call(operation_name, kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/context.py", line 123, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 1094, in _make_api_call
+    raise error_class(parsed_response, operation_name)
+botocore.exceptions.ClientError: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+2026-04-24 21:34:59,681 [ERROR] Outer loop error: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+Traceback (most recent call last):
+  File "/home/ec2-user/google-docs-live/doc_finalizer_worker.py", line 295, in main
+    resp = sqs.receive_message(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 606, in _api_call
+    return self._make_api_call(operation_name, kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/context.py", line 123, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 1094, in _make_api_call
+    raise error_class(parsed_response, operation_name)
+botocore.exceptions.ClientError: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+2026-04-24 21:35:09,719 [ERROR] Outer loop error: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+Traceback (most recent call last):
+  File "/home/ec2-user/google-docs-live/doc_finalizer_worker.py", line 295, in main
+    resp = sqs.receive_message(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 606, in _api_call
+    return self._make_api_call(operation_name, kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/context.py", line 123, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 1094, in _make_api_call
+    raise error_class(parsed_response, operation_name)
+botocore.exceptions.ClientError: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+2026-04-24 21:35:19,756 [ERROR] Outer loop error: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+Traceback (most recent call last):
+  File "/home/ec2-user/google-docs-live/doc_finalizer_worker.py", line 295, in main
+    resp = sqs.receive_message(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 606, in _api_call
+    return self._make_api_call(operation_name, kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/context.py", line 123, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 1094, in _make_api_call
+    raise error_class(parsed_response, operation_name)
+botocore.exceptions.ClientError: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+2026-04-24 21:35:29,795 [ERROR] Outer loop error: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+Traceback (most recent call last):
+  File "/home/ec2-user/google-docs-live/doc_finalizer_worker.py", line 295, in main
+    resp = sqs.receive_message(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 606, in _api_call
+    return self._make_api_call(operation_name, kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/context.py", line 123, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 1094, in _make_api_call
+    raise error_class(parsed_response, operation_name)
+botocore.exceptions.ClientError: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+2026-04-24 21:35:39,829 [ERROR] Outer loop error: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+Traceback (most recent call last):
+  File "/home/ec2-user/google-docs-live/doc_finalizer_worker.py", line 295, in main
+    resp = sqs.receive_message(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 606, in _api_call
+    return self._make_api_call(operation_name, kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/context.py", line 123, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 1094, in _make_api_call
+    raise error_class(parsed_response, operation_name)
+botocore.exceptions.ClientError: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+2026-04-24 21:35:49,862 [ERROR] Outer loop error: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+Traceback (most recent call last):
+  File "/home/ec2-user/google-docs-live/doc_finalizer_worker.py", line 295, in main
+    resp = sqs.receive_message(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 606, in _api_call
+    return self._make_api_call(operation_name, kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/context.py", line 123, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 1094, in _make_api_call
+    raise error_class(parsed_response, operation_name)
+botocore.exceptions.ClientError: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+2026-04-24 21:35:59,898 [ERROR] Outer loop error: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+Traceback (most recent call last):
+  File "/home/ec2-user/google-docs-live/doc_finalizer_worker.py", line 295, in main
+    resp = sqs.receive_message(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 606, in _api_call
+    return self._make_api_call(operation_name, kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/context.py", line 123, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 1094, in _make_api_call
+    raise error_class(parsed_response, operation_name)
+botocore.exceptions.ClientError: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+2026-04-24 21:36:09,935 [ERROR] Outer loop error: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+Traceback (most recent call last):
+  File "/home/ec2-user/google-docs-live/doc_finalizer_worker.py", line 295, in main
+    resp = sqs.receive_message(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 606, in _api_call
+    return self._make_api_call(operation_name, kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/context.py", line 123, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 1094, in _make_api_call
+    raise error_class(parsed_response, operation_name)
+botocore.exceptions.ClientError: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+2026-04-24 21:36:19,967 [ERROR] Outer loop error: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+Traceback (most recent call last):
+  File "/home/ec2-user/google-docs-live/doc_finalizer_worker.py", line 295, in main
+    resp = sqs.receive_message(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 606, in _api_call
+    return self._make_api_call(operation_name, kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/context.py", line 123, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 1094, in _make_api_call
+    raise error_class(parsed_response, operation_name)
+botocore.exceptions.ClientError: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+2026-04-24 21:36:29,994 [ERROR] Outer loop error: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+Traceback (most recent call last):
+  File "/home/ec2-user/google-docs-live/doc_finalizer_worker.py", line 295, in main
+    resp = sqs.receive_message(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 606, in _api_call
+    return self._make_api_call(operation_name, kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/context.py", line 123, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ec2-user/.local/lib/python3.11/site-packages/botocore/client.py", line 1094, in _make_api_call
+    raise error_class(parsed_response, operation_name)
+botocore.exceptions.ClientError: An error occurred (AccessDenied) when calling the ReceiveMessage operation: User: arn:aws:sts::985100584614:assumed-role/transcript-ec2-role/i-037bbefef2321c51d is not authorized to perform: sqs:receivemessage on resource: arn:aws:sqs:us-east-1:985100584614:zoom-docs-finalize-queue because no identity-based policy allows the sqs:receivemessage action
+2026-04-24 21:36:40,082 [INFO] Received finalize trigger for meeting_id=97634908122
+2026-04-24 21:36:40,156 [INFO] Waiting 60s for recording processor to finish S3 upload...
+2026-04-24 21:37:04,221 [INFO] Found credentials from IAM Role: transcript-ec2-role
+2026-04-24 21:37:04,333 [INFO] doc_finalizer_worker starting...
+2026-04-24 21:37:04,333 [INFO] Queue: https://sqs.us-east-1.amazonaws.com/985100584614/zoom-docs-finalize-queue
+2026-04-24 21:37:04,333 [INFO] Wait before search: 60s
+2026-04-24 21:37:04,392 [INFO] Received finalize trigger for meeting_id=99386200541
+2026-04-24 21:37:04,460 [INFO] meeting_id=99386200541 was not tracked (no state.json) — skipping
+2026-04-24 21:37:04,575 [INFO] Received finalize trigger for meeting_id=99182185996
+2026-04-24 21:37:04,588 [INFO] meeting_id=99182185996 was not tracked (no state.json) — skipping
+2026-04-24 21:37:04,593 [INFO] Received finalize trigger for meeting_id=91405318516
+2026-04-24 21:37:04,607 [INFO] meeting_id=91405318516 was not tracked (no state.json) — skipping
+2026-04-24 21:37:04,666 [INFO] Received finalize trigger for meeting_id=95286504563
+2026-04-24 21:37:04,677 [INFO] meeting_id=95286504563 was not tracked (no state.json) — skipping
+2026-04-24 21:37:04,721 [INFO] Received finalize trigger for meeting_id=96329841200
+2026-04-24 21:37:04,751 [INFO] Waiting 60s for recording processor to finish S3 upload...
+2026-04-24 21:38:11,478 [INFO] Found final S3 prefix [Interview-Success] for meeting_id=96329841200: Interview-Success/Shivam_Morya/2026/Month-4/Gurpreet_Singh_Bisla/96329841200/Nexon/2026-04-24/Round_Initial/Time-1-52-AM-IST
+2026-04-24 21:38:11,607 [INFO] doc.txt copied to final: s3://zoom-automation-bucket/Interview-Success/Shivam_Morya/2026/Month-4/Gurpreet_Singh_Bisla/96329841200/Nexon/2026-04-24/Round_Initial/Time-1-52-AM-IST/docs/doc.txt
+2026-04-24 21:38:11,650 [INFO] done.json created: s3://zoom-automation-bucket/temp/live-doc-history/96329841200/done.json
+2026-04-24 21:38:11,668 [INFO] Marked meeting_id=96329841200 as finalized in DB
+2026-04-24 21:38:11,669 [INFO] FINALIZED meeting_id=96329841200
+  doc.txt → s3://zoom-automation-bucket/Interview-Success/Shivam_Morya/2026/Month-4/Gurpreet_Singh_Bisla/96329841200/Nexon/2026-04-24/Round_Initial/Time-1-52-AM-IST/docs/doc.txt
+  done.json → s3://zoom-automation-bucket/temp/live-doc-history/96329841200/done.json
+2026-04-24 21:38:11,757 [INFO] Received finalize trigger for meeting_id=93580846773
+2026-04-24 21:38:11,767 [INFO] meeting_id=93580846773 was not tracked (no state.json) — skipping
+2026-04-24 21:38:34,720 [INFO] Received finalize trigger for meeting_id=95307262467
+2026-04-24 21:38:34,763 [INFO] meeting_id=95307262467 was not tracked (no state.json) — skipping
+2026-04-24 21:39:01,837 [INFO] Received finalize trigger for meeting_id=93216345919
+2026-04-24 21:39:01,881 [INFO] meeting_id=93216345919 was not tracked (no state.json) — skipping
+2026-04-24 21:43:39,327 [INFO] Received finalize trigger for meeting_id=98618064842
+2026-04-24 21:43:39,375 [INFO] meeting_id=98618064842 was not tracked (no state.json) — skipping
+2026-04-24 21:46:40,086 [INFO] Received finalize trigger for meeting_id=97634908122
+2026-04-24 21:46:40,155 [INFO] Waiting 60s for recording processor to finish S3 upload...
+2026-04-24 21:47:46,882 [INFO] Found final S3 prefix [Interview-Success] for meeting_id=97634908122: Interview-Success/Hemangi_Shah/2026/Month-4/Vinay_Manohar_Billa/97634908122/EY/2026-04-24/Round_First/Time-2-22-AM-IST
+2026-04-24 21:47:46,972 [INFO] doc.txt copied to final: s3://zoom-automation-bucket/Interview-Success/Hemangi_Shah/2026/Month-4/Vinay_Manohar_Billa/97634908122/EY/2026-04-24/Round_First/Time-2-22-AM-IST/docs/doc.txt
+2026-04-24 21:47:47,020 [INFO] done.json created: s3://zoom-automation-bucket/temp/live-doc-history/97634908122/done.json
+2026-04-24 21:47:47,037 [INFO] Marked meeting_id=97634908122 as finalized in DB
+2026-04-24 21:47:47,037 [INFO] FINALIZED meeting_id=97634908122
+  doc.txt → s3://zoom-automation-bucket/Interview-Success/Hemangi_Shah/2026/Month-4/Vinay_Manohar_Billa/97634908122/EY/2026-04-24/Round_First/Time-2-22-AM-IST/docs/doc.txt
+  done.json → s3://zoom-automation-bucket/temp/live-doc-history/97634908122/done.json
+2026-04-24 21:47:47,075 [INFO] Received finalize trigger for meeting_id=99391473089
+2026-04-24 21:47:47,087 [INFO] meeting_id=99391473089 was not tracked (no state.json) — skipping
+2026-04-24 21:47:47,092 [INFO] Received finalize trigger for meeting_id=96464284775
+2026-04-24 21:47:47,114 [INFO] Waiting 60s for recording processor to finish S3 upload...
+2026-04-24 21:48:54,126 [INFO] Found final S3 prefix [Interview-Success] for meeting_id=96464284775: Interview-Success/Charul_Patel/2026/Month-4/Samyukth_-_challa/96464284775/teksystems/2026-04-24/Round_First/Time-3-01-AM-IST
+2026-04-24 21:48:54,216 [INFO] doc.txt copied to final: s3://zoom-automation-bucket/Interview-Success/Charul_Patel/2026/Month-4/Samyukth_-_challa/96464284775/teksystems/2026-04-24/Round_First/Time-3-01-AM-IST/docs/doc.txt
+2026-04-24 21:48:54,258 [INFO] done.json created: s3://zoom-automation-bucket/temp/live-doc-history/96464284775/done.json
+2026-04-24 21:48:54,275 [INFO] Marked meeting_id=96464284775 as finalized in DB
+2026-04-24 21:48:54,275 [INFO] FINALIZED meeting_id=96464284775
+  doc.txt → s3://zoom-automation-bucket/Interview-Success/Charul_Patel/2026/Month-4/Samyukth_-_challa/96464284775/teksystems/2026-04-24/Round_First/Time-3-01-AM-IST/docs/doc.txt
+  done.json → s3://zoom-automation-bucket/temp/live-doc-history/96464284775/done.json
+2026-04-24 21:50:11,496 [INFO] Received finalize trigger for meeting_id=92215087348
+2026-04-24 21:50:11,599 [INFO] Waiting 60s for recording processor to finish S3 upload...
+2026-04-24 21:51:18,345 [INFO] Found final S3 prefix [Interview-Success] for meeting_id=92215087348: Interview-Success/Yashvi_Nagar/2026/Month-4/Likith_Pawan_Kagita/92215087348/Intel/2026-04-24/Round_First/Time-2-51-AM-IST
+2026-04-24 21:51:18,469 [INFO] doc.txt copied to final: s3://zoom-automation-bucket/Interview-Success/Yashvi_Nagar/2026/Month-4/Likith_Pawan_Kagita/92215087348/Intel/2026-04-24/Round_First/Time-2-51-AM-IST/docs/doc.txt
+2026-04-24 21:51:18,511 [INFO] done.json created: s3://zoom-automation-bucket/temp/live-doc-history/92215087348/done.json
+2026-04-24 21:51:18,526 [INFO] Marked meeting_id=92215087348 as finalized in DB
+2026-04-24 21:51:18,526 [INFO] FINALIZED meeting_id=92215087348
+  doc.txt → s3://zoom-automation-bucket/Interview-Success/Yashvi_Nagar/2026/Month-4/Likith_Pawan_Kagita/92215087348/Intel/2026-04-24/Round_First/Time-2-51-AM-IST/docs/doc.txt
+  done.json → s3://zoom-automation-bucket/temp/live-doc-history/92215087348/done.json
+2026-04-24 21:51:21,483 [INFO] Received finalize trigger for meeting_id=98850354950
+2026-04-24 21:51:21,496 [INFO] meeting_id=98850354950 was not tracked (no state.json) — skipping
+2026-04-24 21:56:29,106 [INFO] Received finalize trigger for meeting_id=95677244177
+2026-04-24 21:56:29,156 [INFO] meeting_id=95677244177 was not tracked (no state.json) — skipping
+2026-04-24 22:08:00,875 [INFO] Received finalize trigger for meeting_id=99232947903
+2026-04-24 22:08:00,940 [INFO] Waiting 60s for recording processor to finish S3 upload...
+2026-04-24 22:09:11,280 [INFO] Found final S3 prefix [Interview-Success] for meeting_id=99232947903: Interview-Success/Abhishek_Jain/2026/Month-4/Sai_chandra_bandi/99232947903/nace_AI/2026-04-24/Round_First/Time-2-52-AM-IST
+2026-04-24 22:09:11,369 [INFO] doc.txt copied to final: s3://zoom-automation-bucket/Interview-Success/Abhishek_Jain/2026/Month-4/Sai_chandra_bandi/99232947903/nace_AI/2026-04-24/Round_First/Time-2-52-AM-IST/docs/doc.txt
+2026-04-24 22:09:11,420 [INFO] done.json created: s3://zoom-automation-bucket/temp/live-doc-history/99232947903/done.json
+2026-04-24 22:09:11,436 [INFO] Marked meeting_id=99232947903 as finalized in DB
+2026-04-24 22:09:11,437 [INFO] FINALIZED meeting_id=99232947903
+  doc.txt → s3://zoom-automation-bucket/Interview-Success/Abhishek_Jain/2026/Month-4/Sai_chandra_bandi/99232947903/nace_AI/2026-04-24/Round_First/Time-2-52-AM-IST/docs/doc.txt
+  done.json → s3://zoom-automation-bucket/temp/live-doc-history/99232947903/done.json
+2026-04-24 22:09:11,521 [INFO] Received finalize trigger for meeting_id=99183774568
+2026-04-24 22:09:11,535 [INFO] meeting_id=99183774568 was not tracked (no state.json) — skipping
+2026-04-24 22:12:00,914 [INFO] Received finalize trigger for meeting_id=93561244745
+2026-04-24 22:12:00,965 [INFO] meeting_id=93561244745 was not tracked (no state.json) — skipping
+2026-04-24 22:21:41,398 [INFO] Received finalize trigger for meeting_id=99099048099
+2026-04-24 22:21:41,441 [INFO] meeting_id=99099048099 was not tracked (no state.json) — skipping
+2026-04-24 22:27:49,631 [INFO] Received finalize trigger for meeting_id=95208631596
+2026-04-24 22:27:49,679 [INFO] meeting_id=95208631596 was not tracked (no state.json) — skipping
+2026-04-24 22:50:14,213 [INFO] Received finalize trigger for meeting_id=91457938199
+2026-04-24 22:50:14,274 [INFO] Waiting 60s for recording processor to finish S3 upload...
+2026-04-24 22:51:21,153 [INFO] Found final S3 prefix [Interview-Success] for meeting_id=91457938199: Interview-Success/Abhishek_Jain/2026/Month-4/Krupali_Arvindbhai_Dangshiya/91457938199/Kai/2026-04-24/Round_First/Time-3-35-AM-IST
+2026-04-24 22:51:21,317 [INFO] doc.txt copied to final: s3://zoom-automation-bucket/Interview-Success/Abhishek_Jain/2026/Month-4/Krupali_Arvindbhai_Dangshiya/91457938199/Kai/2026-04-24/Round_First/Time-3-35-AM-IST/docs/doc.txt
+2026-04-24 22:51:21,370 [INFO] done.json created: s3://zoom-automation-bucket/temp/live-doc-history/91457938199/done.json
+2026-04-24 22:51:21,385 [INFO] Marked meeting_id=91457938199 as finalized in DB
+2026-04-24 22:51:21,385 [INFO] FINALIZED meeting_id=91457938199
+  doc.txt → s3://zoom-automation-bucket/Interview-Success/Abhishek_Jain/2026/Month-4/Krupali_Arvindbhai_Dangshiya/91457938199/Kai/2026-04-24/Round_First/Time-3-35-AM-IST/docs/doc.txt
+  done.json → s3://zoom-automation-bucket/temp/live-doc-history/91457938199/done.json
+2026-04-24 22:58:05,256 [INFO] Received finalize trigger for meeting_id=92150179789
+2026-04-24 22:58:05,324 [INFO] Waiting 60s for recording processor to finish S3 upload...
+2026-04-24 22:59:11,838 [INFO] Found final S3 prefix [Interview-Success] for meeting_id=92150179789: Interview-Success/Vivek_Parmar/2026/Month-4/Dimple_Galla/92150179789/Adobe/2026-04-24/Round_Final/Time-3-23-AM-IST
+2026-04-24 22:59:11,948 [INFO] doc.txt copied to final: s3://zoom-automation-bucket/Interview-Success/Vivek_Parmar/2026/Month-4/Dimple_Galla/92150179789/Adobe/2026-04-24/Round_Final/Time-3-23-AM-IST/docs/doc.txt
+2026-04-24 22:59:11,995 [INFO] done.json created: s3://zoom-automation-bucket/temp/live-doc-history/92150179789/done.json
+2026-04-24 22:59:12,011 [INFO] Marked meeting_id=92150179789 as finalized in DB
+2026-04-24 22:59:12,011 [INFO] FINALIZED meeting_id=92150179789
+  doc.txt → s3://zoom-automation-bucket/Interview-Success/Vivek_Parmar/2026/Month-4/Dimple_Galla/92150179789/Adobe/2026-04-24/Round_Final/Time-3-23-AM-IST/docs/doc.txt
+  done.json → s3://zoom-automation-bucket/temp/live-doc-history/92150179789/done.json
+2026-04-25 00:13:18,965 [INFO] Received finalize trigger for meeting_id=91749977533
+2026-04-25 00:13:19,012 [INFO] meeting_id=91749977533 was not tracked (no state.json) — skipping
+2026-04-25 00:42:02,712 [INFO] Received finalize trigger for meeting_id=91749977533
+2026-04-25 00:42:02,769 [INFO] meeting_id=91749977533 was not tracked (no state.json) — skipping

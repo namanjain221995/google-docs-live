@@ -1,0 +1,124 @@
+2026-04-24 22:21:07,365 [INFO] [MainThread] Found credentials from IAM Role: transcript-ec2-role
+2026-04-24 22:21:07,483 [INFO] [MainThread] === retry_unfinalized starting ===
+2026-04-24 22:21:07,483 [INFO] [MainThread] Scanning temp/live-doc-history/ for unfinalized meetings...
+2026-04-24 22:21:07,590 [INFO] [MainThread] Found 94 tracked meetings, 92 finalized, 2 need retry
+2026-04-24 22:21:07,590 [INFO] [MainThread] Retrying 2 meetings with 20 parallel workers...
+2026-04-24 22:21:19,895 [INFO] [MainThread] SKIP  91457938199 — recording folder not in S3 yet
+2026-04-24 22:21:20,004 [INFO] [MainThread] SKIP  92150179789 — recording folder not in S3 yet
+2026-04-24 22:21:20,005 [INFO] [MainThread] 
+=== retry_unfinalized complete ===
+  Finalized:       0
+  No doc.txt:      0
+  Still skipped:   2 (recording not in S3 yet)
+  Errors:          0
+
+2026-04-24 22:21:20,005 [INFO] [MainThread] Still skipped (run again later): ['91457938199', '92150179789']
+2026-04-24 22:32:03,258 [INFO] [MainThread] Found credentials from IAM Role: transcript-ec2-role
+2026-04-24 22:32:03,366 [INFO] [MainThread] === retry_unfinalized starting ===
+2026-04-24 22:32:03,366 [INFO] [MainThread] Scanning temp/live-doc-history/ for unfinalized meetings...
+2026-04-24 22:32:03,462 [INFO] [MainThread] Found 94 tracked meetings, 92 finalized, 2 need retry
+2026-04-24 22:32:03,463 [INFO] [MainThread] Retrying 2 meetings with 20 parallel workers...
+2026-04-24 22:32:16,238 [INFO] [MainThread] SKIP  91457938199 — recording folder not in S3 yet
+2026-04-24 22:32:16,345 [INFO] [MainThread] SKIP  92150179789 — recording folder not in S3 yet
+2026-04-24 22:32:16,346 [INFO] [MainThread] 
+=== retry_unfinalized complete ===
+  Finalized:       0
+  No doc.txt:      0
+  Still skipped:   2 (recording not in S3 yet)
+  Errors:          0
+
+2026-04-24 22:32:16,346 [INFO] [MainThread] Still skipped (run again later): ['91457938199', '92150179789']
+2026-04-24 22:43:03,263 [INFO] [MainThread] Found credentials from IAM Role: transcript-ec2-role
+2026-04-24 22:43:03,371 [INFO] [MainThread] === retry_unfinalized starting ===
+2026-04-24 22:43:03,371 [INFO] [MainThread] Scanning temp/live-doc-history/ for unfinalized meetings...
+2026-04-24 22:43:03,474 [INFO] [MainThread] Found 94 tracked meetings, 92 finalized, 2 need retry
+2026-04-24 22:43:03,474 [INFO] [MainThread] Retrying 2 meetings with 20 parallel workers...
+2026-04-24 22:43:15,893 [INFO] [MainThread] SKIP  91457938199 — recording folder not in S3 yet
+2026-04-24 22:43:15,997 [INFO] [MainThread] SKIP  92150179789 — recording folder not in S3 yet
+2026-04-24 22:43:15,998 [INFO] [MainThread] 
+=== retry_unfinalized complete ===
+  Finalized:       0
+  No doc.txt:      0
+  Still skipped:   2 (recording not in S3 yet)
+  Errors:          0
+
+2026-04-24 22:43:15,998 [INFO] [MainThread] Still skipped (run again later): ['91457938199', '92150179789']
+2026-04-24 22:54:03,268 [INFO] [MainThread] Found credentials from IAM Role: transcript-ec2-role
+2026-04-24 22:54:03,376 [INFO] [MainThread] === retry_unfinalized starting ===
+2026-04-24 22:54:03,376 [INFO] [MainThread] Scanning temp/live-doc-history/ for unfinalized meetings...
+2026-04-24 22:54:03,498 [INFO] [MainThread] Found 94 tracked meetings, 93 finalized, 1 need retry
+2026-04-24 22:54:03,498 [INFO] [MainThread] Retrying 1 meetings with 20 parallel workers...
+2026-04-24 22:54:12,822 [INFO] [MainThread] SKIP  92150179789 — recording folder not in S3 yet
+2026-04-24 22:54:12,822 [INFO] [MainThread] 
+=== retry_unfinalized complete ===
+  Finalized:       0
+  No doc.txt:      0
+  Still skipped:   1 (recording not in S3 yet)
+  Errors:          0
+
+2026-04-24 22:54:12,823 [INFO] [MainThread] Still skipped (run again later): ['92150179789']
+2026-04-24 23:04:03,288 [INFO] [MainThread] Found credentials from IAM Role: transcript-ec2-role
+2026-04-24 23:04:03,398 [INFO] [MainThread] === retry_unfinalized starting ===
+2026-04-24 23:04:03,398 [INFO] [MainThread] Scanning temp/live-doc-history/ for unfinalized meetings...
+2026-04-24 23:04:03,536 [INFO] [MainThread] Found 94 tracked meetings, 94 finalized, 0 need retry
+2026-04-24 23:04:03,536 [INFO] [MainThread] Nothing to retry. All tracked meetings are finalized.
+2026-04-24 23:14:03,468 [INFO] [MainThread] Found credentials from IAM Role: transcript-ec2-role
+2026-04-24 23:14:03,575 [INFO] [MainThread] === retry_unfinalized starting ===
+2026-04-24 23:14:03,575 [INFO] [MainThread] Scanning temp/live-doc-history/ for unfinalized meetings...
+2026-04-24 23:14:03,679 [INFO] [MainThread] Found 94 tracked meetings, 94 finalized, 0 need retry
+2026-04-24 23:14:03,679 [INFO] [MainThread] Nothing to retry. All tracked meetings are finalized.
+2026-04-24 23:24:03,586 [INFO] [MainThread] Found credentials from IAM Role: transcript-ec2-role
+2026-04-24 23:24:03,708 [INFO] [MainThread] === retry_unfinalized starting ===
+2026-04-24 23:24:03,708 [INFO] [MainThread] Scanning temp/live-doc-history/ for unfinalized meetings...
+2026-04-24 23:24:03,830 [INFO] [MainThread] Found 94 tracked meetings, 94 finalized, 0 need retry
+2026-04-24 23:24:03,831 [INFO] [MainThread] Nothing to retry. All tracked meetings are finalized.
+2026-04-24 23:35:03,267 [INFO] [MainThread] Found credentials from IAM Role: transcript-ec2-role
+2026-04-24 23:35:03,377 [INFO] [MainThread] === retry_unfinalized starting ===
+2026-04-24 23:35:03,378 [INFO] [MainThread] Scanning temp/live-doc-history/ for unfinalized meetings...
+2026-04-24 23:35:03,497 [INFO] [MainThread] Found 94 tracked meetings, 94 finalized, 0 need retry
+2026-04-24 23:35:03,497 [INFO] [MainThread] Nothing to retry. All tracked meetings are finalized.
+2026-04-24 23:46:03,274 [INFO] [MainThread] Found credentials from IAM Role: transcript-ec2-role
+2026-04-24 23:46:03,400 [INFO] [MainThread] === retry_unfinalized starting ===
+2026-04-24 23:46:03,401 [INFO] [MainThread] Scanning temp/live-doc-history/ for unfinalized meetings...
+2026-04-24 23:46:03,509 [INFO] [MainThread] Found 94 tracked meetings, 94 finalized, 0 need retry
+2026-04-24 23:46:03,509 [INFO] [MainThread] Nothing to retry. All tracked meetings are finalized.
+2026-04-24 23:56:03,297 [INFO] [MainThread] Found credentials from IAM Role: transcript-ec2-role
+2026-04-24 23:56:03,409 [INFO] [MainThread] === retry_unfinalized starting ===
+2026-04-24 23:56:03,409 [INFO] [MainThread] Scanning temp/live-doc-history/ for unfinalized meetings...
+2026-04-24 23:56:03,520 [INFO] [MainThread] Found 94 tracked meetings, 94 finalized, 0 need retry
+2026-04-24 23:56:03,521 [INFO] [MainThread] Nothing to retry. All tracked meetings are finalized.
+2026-04-25 00:06:03,561 [INFO] [MainThread] Found credentials from IAM Role: transcript-ec2-role
+2026-04-25 00:06:03,669 [INFO] [MainThread] === retry_unfinalized starting ===
+2026-04-25 00:06:03,669 [INFO] [MainThread] Scanning temp/live-doc-history/ for unfinalized meetings...
+2026-04-25 00:06:03,789 [INFO] [MainThread] Found 94 tracked meetings, 94 finalized, 0 need retry
+2026-04-25 00:06:03,789 [INFO] [MainThread] Nothing to retry. All tracked meetings are finalized.
+2026-04-25 00:17:03,314 [INFO] [MainThread] Found credentials from IAM Role: transcript-ec2-role
+2026-04-25 00:17:03,432 [INFO] [MainThread] === retry_unfinalized starting ===
+2026-04-25 00:17:03,432 [INFO] [MainThread] Scanning temp/live-doc-history/ for unfinalized meetings...
+2026-04-25 00:17:03,550 [INFO] [MainThread] Found 94 tracked meetings, 94 finalized, 0 need retry
+2026-04-25 00:17:03,550 [INFO] [MainThread] Nothing to retry. All tracked meetings are finalized.
+2026-04-25 00:27:03,297 [INFO] [MainThread] Found credentials from IAM Role: transcript-ec2-role
+2026-04-25 00:27:03,403 [INFO] [MainThread] === retry_unfinalized starting ===
+2026-04-25 00:27:03,403 [INFO] [MainThread] Scanning temp/live-doc-history/ for unfinalized meetings...
+2026-04-25 00:27:03,508 [INFO] [MainThread] Found 94 tracked meetings, 94 finalized, 0 need retry
+2026-04-25 00:27:03,509 [INFO] [MainThread] Nothing to retry. All tracked meetings are finalized.
+2026-04-25 00:38:03,276 [INFO] [MainThread] Found credentials from IAM Role: transcript-ec2-role
+2026-04-25 00:38:03,394 [INFO] [MainThread] === retry_unfinalized starting ===
+2026-04-25 00:38:03,394 [INFO] [MainThread] Scanning temp/live-doc-history/ for unfinalized meetings...
+2026-04-25 00:38:03,508 [INFO] [MainThread] Found 94 tracked meetings, 94 finalized, 0 need retry
+2026-04-25 00:38:03,508 [INFO] [MainThread] Nothing to retry. All tracked meetings are finalized.
+2026-04-25 00:48:03,442 [INFO] [MainThread] Found credentials from IAM Role: transcript-ec2-role
+2026-04-25 00:48:03,547 [INFO] [MainThread] === retry_unfinalized starting ===
+2026-04-25 00:48:03,548 [INFO] [MainThread] Scanning temp/live-doc-history/ for unfinalized meetings...
+2026-04-25 00:48:03,656 [INFO] [MainThread] Found 94 tracked meetings, 94 finalized, 0 need retry
+2026-04-25 00:48:03,656 [INFO] [MainThread] Nothing to retry. All tracked meetings are finalized.
+2026-04-25 00:59:03,323 [INFO] [MainThread] Found credentials from IAM Role: transcript-ec2-role
+2026-04-25 00:59:03,434 [INFO] [MainThread] === retry_unfinalized starting ===
+2026-04-25 00:59:03,434 [INFO] [MainThread] Scanning temp/live-doc-history/ for unfinalized meetings...
+2026-04-25 00:59:03,542 [INFO] [MainThread] Found 94 tracked meetings, 94 finalized, 0 need retry
+2026-04-25 00:59:03,542 [INFO] [MainThread] Nothing to retry. All tracked meetings are finalized.
+2026-04-25 01:10:01,612 [INFO] [MainThread] Found credentials from IAM Role: transcript-ec2-role
+2026-04-25 01:10:01,728 [INFO] [MainThread] === retry_unfinalized starting ===
+2026-04-25 01:10:01,729 [INFO] [MainThread] Scanning temp/live-doc-history/ for unfinalized meetings...
+2026-04-25 01:10:01,860 [INFO] [MainThread] Found 94 tracked meetings, 94 finalized, 0 need retry
+2026-04-25 01:10:01,860 [INFO] [MainThread] Nothing to retry. All tracked meetings are finalized.
