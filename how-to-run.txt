@@ -1,6 +1,8 @@
 # Watch live logs
 sudo journalctl -u meeting-start-worker -f
 sudo journalctl -u google-change-worker -f
+sudo journalctl -u doc-finalizer-worker -f
+sudo systemctl restart meeting-start-worker doc-finalizer-worker google-change-worker
 
 # Check DB for tracked meetings
 PGPASSWORD='DocHistory2026' psql -U postgres -h 127.0.0.1 -d dochistory \
