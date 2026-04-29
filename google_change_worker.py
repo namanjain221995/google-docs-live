@@ -341,12 +341,21 @@ def idle_retry_loop():
             log.error(f"Idle retry loop error: {e}", exc_info=True)
 
 # ── GOOGLE DOC TEXT EXTRACTION ──
-def fix_encoding(text):
-    """Fix UTF-8 bytes decoded as latin-1 by Google API."""
+def decode_text_safely(raw: bytes) -> str:
+    """Permanent Unicode decoder - supports emojis, arrows, all Unicode."""
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
     try:
-        return text.encode("latin-1").decode("utf-8").lstrip("\ufeff")
-    except (UnicodeDecodeError, UnicodeEncodeError):
-        return text.lstrip("\ufeff")
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("utf-8", errors="replace")
+
+
+def fix_encoding(text: str) -> str:
+    """Clean text - strip BOM only. Never use latin-1. Preserves all Unicode."""
+    if not text:
+        return text
+    return text.lstrip("\ufeff")
 
 def extract_text_from_doc(doc_id):
     """
@@ -367,7 +376,7 @@ def extract_text_from_doc(doc_id):
         while not done:
             _, done = downloader.next_chunk()
         raw_bytes  = buffer.getvalue()
-        plain_text = fix_encoding(raw_bytes.decode("latin-1"))
+        plain_text = (decode_text_safely(raw_bytes))
         log.info(f"export_media success for doc_id={doc_id} length={len(plain_text)}")
 
     except Exception as e:
