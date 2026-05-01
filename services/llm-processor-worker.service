@@ -1,0 +1,19 @@
+[Unit]
+Description=LLM Processor Worker - Analyzes interview docs + transcripts via GPT
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/google-docs-live
+EnvironmentFile=/home/ec2-user/google-docs-live/env
+ExecStart=/usr/bin/python3.11 /home/ec2-user/google-docs-live/llm_processor_worker.py
+Restart=always
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=llm-processor-worker
+
+[Install]
+WantedBy=multi-user.target

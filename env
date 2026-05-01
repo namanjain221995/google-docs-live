@@ -13,3 +13,5 @@ DELETE_TEMP_AFTER_FINALIZE=false
 DOCS_FINALIZE_QUEUE_URL=https://sqs.us-east-1.amazonaws.com/985100584614/zoom-docs-finalize-queue
 WAIT_BEFORE_SEARCH_SECONDS=60
 DB_PASS=DocHistory2026
+API_SECRET_NAME=secrets/api
+PROMPT_FILE=/home/ec2-user/google-docs-live/prompt.txt
