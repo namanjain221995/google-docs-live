@@ -294,20 +294,34 @@ def find_unprocessed_meetings() -> list[dict]:
 # ── CALL GPT ──
 def call_gpt(prompt: str, doc_txt: str, transcript: str) -> str:
     client = get_openai_client()
-    user_message = f"""{prompt}
+    # Truncate to fit within context window
+    doc_trunc        = doc_txt[:30000]
+    transcript_trunc = transcript[:30000]
 
-==================== INTERVIEW NOTES (Google Doc) ====================
-{doc_txt}
+    user_input = json.dumps({
+        "transcript_webvtt": transcript_trunc,
+        "document_version_history": doc_trunc,
+        "analysis_context": {
+            "candidate_name_hint": None,
+            "company_name_hint": None,
+            "role_title_hint": None,
+            "round_type_hint": None,
+            "timezone_hint": "IST",
+            "meeting_start_absolute_hint": None,
+            "is_mock_interview": True
+        },
+        "support_reference_materials": []
+    }, ensure_ascii=False)
 
-==================== ZOOM TRANSCRIPT ====================
-{transcript}
-"""
+    user_message = prompt + "\n\nINPUT:\n" + user_input
+    # Each meeting = fresh conversation, no memory of previous meetings
+    # gpt-5.5 requires max_completion_tokens, no temperature
     response = client.chat.completions.create(
-        model="gpt-4-turbo",
+        model="gpt-4o",
         messages=[
             {
                 "role": "system",
-                "content": "You are an expert interview analyst. Analyze the provided interview notes and transcript carefully."
+                "content": "You are an expert interview analyst. Analyze the provided interview notes and transcript carefully. Each interview is independent — do not reference or remember any previous interviews."
             },
             {
                 "role": "user",
@@ -362,12 +376,24 @@ def process_one_meeting(item: dict) -> str:
     if not prompt:
         return f"ERROR {meeting_id} — prompt.txt empty"
 
-    # Call GPT
+    # Call GPT with retry
     log.info(f"Calling GPT for meeting_id={meeting_id}...")
-    try:
-        llm_output = call_gpt(prompt, doc_txt, transcript)
-    except Exception as e:
-        return f"ERROR {meeting_id} — GPT failed: {e}"
+    llm_output = None
+    for attempt in range(3):  # 3 attempts
+        try:
+            llm_output = call_gpt(prompt, doc_txt, transcript)
+            if llm_output:
+                break
+            log.warning(f"Empty output attempt {attempt+1} for {meeting_id}")
+        except Exception as e:
+            log.warning(f"GPT attempt {attempt+1} failed for {meeting_id}: {e}")
+            if attempt < 2:
+                time.sleep(5)  # Wait 5s before retry
+            else:
+                return f"ERROR {meeting_id} — GPT failed after 3 attempts: {e}"
+
+    if not llm_output:
+        return f"ERROR {meeting_id} — GPT returned empty output after 3 attempts"
 
     # Save llm.txt to the SAME folder as transcript/docs
     now_utc = datetime.now(timezone.utc)
