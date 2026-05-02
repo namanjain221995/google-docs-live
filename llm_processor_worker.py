@@ -2,17 +2,15 @@
 llm_processor_worker.py
 -----------------------
 Scans S3 for meetings that have done.json but no llm-done.json.
+Uses AWS Bedrock Claude Haiku 4.5 for LLM analysis.
 
 For each meeting:
-1. Searches ALL of Interview-Success for the folder containing /<meeting_id>/
+1. Searches ALL of Interview-Success for /<meeting_id>/
 2. Finds the EXACT folder that has TRANSCRIPT/*.vtt
-3. Uses THAT same folder for:
-   - Reading TRANSCRIPT/*.vtt
-   - Reading docs/doc.txt
-   - Writing llm/llm.txt
-4. Creates temp/.../llm-done.json
+3. Uses THAT same folder for doc.txt, transcript, llm output
+4. Creates llm-done.json in temp
 
-Uses 10 parallel workers.
+Uses 30 parallel workers. Newest meetings processed first.
 """
 
 import os
@@ -22,20 +20,22 @@ import time
 import logging
 import threading
 import boto3
+from botocore.config import Config
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from openai import OpenAI
 
 # ── CONFIG ──
 AWS_REGION      = os.environ.get("AWS_REGION", "us-east-1")
 S3_BUCKET       = os.environ.get("S3_BUCKET", "zoom-automation-bucket")
-API_SECRET_NAME = os.environ.get("API_SECRET_NAME", "secrets/api")
 PROMPT_FILE     = os.environ.get("PROMPT_FILE",
     "/home/ec2-user/google-docs-live/prompt.txt")
 MAX_WORKERS     = 30
 POLL_INTERVAL   = 60
 IST_OFFSET      = timedelta(hours=5, minutes=30)
 DEPARTMENTS     = ["Interview-Success", "Training", "Customer-Success", "Marketing"]
+
+# Bedrock model
+BEDROCK_MODEL_ID = "anthropic.claude-haiku-4-5-20251001"
 
 # ── LOGGING ──
 os.makedirs("/home/ec2-user/google-docs-live/logs", exist_ok=True)
@@ -49,27 +49,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("llm_processor_worker")
 
-# ── AWS ── (large connection pool for 100 workers)
-from botocore.config import Config
-
-boto_config = Config(
-    max_pool_connections=150  # supports 100+ concurrent workers
-)
-s3 = boto3.client("s3", region_name=AWS_REGION, config=boto_config)
-sm = boto3.client("secretsmanager", region_name=AWS_REGION, config=boto_config)
-
-# ── OPENAI ──
-_openai_client = None
-_openai_lock   = threading.Lock()
-
-def get_openai_client():
-    global _openai_client
-    with _openai_lock:
-        if _openai_client:
-            return _openai_client
-        secret         = json.loads(sm.get_secret_value(SecretId=API_SECRET_NAME)["SecretString"])
-        _openai_client = OpenAI(api_key=secret["OPENAI_API_KEY"])
-    return _openai_client
+# ── AWS ── (large connection pool for 30 workers)
+boto_config = Config(max_pool_connections=150)
+s3              = boto3.client("s3", region_name=AWS_REGION, config=boto_config)
+bedrock_runtime = boto3.client("bedrock-runtime", region_name=AWS_REGION, config=boto_config)
 
 # ── PROMPT ──
 def load_prompt() -> str:
@@ -127,27 +110,11 @@ def write_s3_json(key: str, data: dict):
         ContentType="application/json"
     )
 
-# ── CORE: FIND REAL FOLDER FOR MEETING ──
+# ── FIND REAL FOLDER FOR MEETING ──
 def find_meeting_folder(meeting_id: str) -> dict | None:
-    """
-    Search ALL departments for /<meeting_id>/.
-    Returns the folder info that has TRANSCRIPT/*.vtt.
-    This is the single source of truth for all paths.
-
-    Returns dict:
-    {
-        "base_prefix":      "Interview-Success/Host/2026/Month-4/Candidate/MeetingID/Company/Date/Round/Time",
-        "transcript_key":   "Interview-Success/.../TRANSCRIPT/file.vtt",
-        "doc_key":          "Interview-Success/.../docs/doc.txt",
-        "llm_key":          "Interview-Success/.../llm/llm.txt",
-    }
-    """
     paginator  = s3.get_paginator("list_objects_v2")
     search_str = f"/{meeting_id}/"
-
-    # Collect all unique base prefixes that contain this meeting_id
-    # and map them to their files
-    prefix_files = {}  # base_prefix -> list of keys
+    prefix_files = {}
 
     for dept in DEPARTMENTS:
         try:
@@ -161,21 +128,14 @@ def find_meeting_folder(meeting_id: str) -> dict | None:
                         mid_idx = parts.index(meeting_id)
                     except ValueError:
                         continue
-                    # Base prefix = everything up to and including time folder
-                    # Structure: dept/host/year/month/candidate/meetingid/company/date/round/time/...
-                    # We want: dept/host/year/month/candidate/meetingid/company/date/round/time
-                    # That's mid_idx + 4 parts after meeting_id for Interview-Success
-                    # or mid_idx + 2 for others
                     if dept == "Interview-Success":
-                        end = mid_idx + 5  # company/date/round/time
+                        end = mid_idx + 5
                     else:
-                        end = mid_idx + 3  # date/time
-
+                        end = mid_idx + 3
                     if len(parts) > end:
                         base = "/".join(parts[:end])
                     else:
                         base = "/".join(parts[:mid_idx + 1])
-
                     if base not in prefix_files:
                         prefix_files[base] = []
                     prefix_files[base].append(key)
@@ -183,11 +143,9 @@ def find_meeting_folder(meeting_id: str) -> dict | None:
             log.warning(f"Search error in {dept}: {e}")
 
     if not prefix_files:
-        log.warning(f"No S3 folder found for meeting_id={meeting_id}")
         return None
 
-    # Find the prefix that has a TRANSCRIPT/*.vtt file
-    best_prefix = None
+    best_prefix    = None
     transcript_key = None
 
     for prefix, keys in prefix_files.items():
@@ -199,7 +157,6 @@ def find_meeting_folder(meeting_id: str) -> dict | None:
         if best_prefix:
             break
 
-    # If no transcript found, use the prefix that has docs/doc.txt
     if not best_prefix:
         for prefix, keys in prefix_files.items():
             for key in keys:
@@ -209,7 +166,6 @@ def find_meeting_folder(meeting_id: str) -> dict | None:
             if best_prefix:
                 break
 
-    # Fallback: use first prefix found
     if not best_prefix:
         best_prefix = sorted(prefix_files.keys())[0]
 
@@ -224,13 +180,8 @@ def find_meeting_folder(meeting_id: str) -> dict | None:
 
 # ── FIND UNPROCESSED MEETINGS ──
 def find_unprocessed_meetings() -> list[dict]:
-    """
-    Returns unprocessed meetings sorted by:
-    1. NEWEST first (by done.json last_modified timestamp)
-    So new meetings are always processed before old ones.
-    """
     paginator   = s3.get_paginator("list_objects_v2")
-    has_done    = {}   # meeting_id -> {key, prefix, last_modified}
+    has_done    = {}
     has_llmdone = set()
 
     for page in paginator.paginate(Bucket=S3_BUCKET, Prefix="temp/live-doc-history/"):
@@ -239,12 +190,10 @@ def find_unprocessed_meetings() -> list[dict]:
             last_modified = obj.get("LastModified")
             parts         = key.split("/")
 
-            # NEW: temp/live-doc-history/YYYY/Month-M/YYYY-MM-DD/meeting_id/file
             if len(parts) == 7 and parts[2].isdigit() and parts[3].startswith("Month-"):
                 meeting_id = parts[5]
                 filename   = parts[6]
                 prefix     = "/".join(parts[:6])
-            # OLD: temp/live-doc-history/meeting_id/file
             elif len(parts) == 4 and parts[2].isdigit():
                 meeting_id = parts[2]
                 filename   = parts[3]
@@ -265,13 +214,13 @@ def find_unprocessed_meetings() -> list[dict]:
     for meeting_id, info in has_done.items():
         if meeting_id not in has_llmdone:
             unprocessed.append({
-                "meeting_id":   meeting_id,
-                "temp_prefix":  info["prefix"],
-                "done_key":     info["key"],
+                "meeting_id":    meeting_id,
+                "temp_prefix":   info["prefix"],
+                "done_key":      info["key"],
                 "last_modified": info["last_modified"],
             })
 
-    # Sort NEWEST first — new meetings processed before old ones
+    # Sort NEWEST first
     unprocessed.sort(
         key=lambda x: x["last_modified"] or datetime.min.replace(tzinfo=timezone.utc),
         reverse=True
@@ -291,13 +240,13 @@ def find_unprocessed_meetings() -> list[dict]:
 
     return unprocessed
 
-# ── CALL GPT ──
-def call_gpt(prompt: str, doc_txt: str, transcript: str) -> str:
-    client = get_openai_client()
+# ── CALL BEDROCK CLAUDE HAIKU 4.5 ──
+def call_bedrock(prompt: str, doc_txt: str, transcript: str) -> str:
     # Truncate to fit within context window
     doc_trunc        = doc_txt[:30000]
     transcript_trunc = transcript[:30000]
 
+    # Build JSON input as prompt expects
     user_input = json.dumps({
         "transcript_webvtt": transcript_trunc,
         "document_version_history": doc_trunc,
@@ -314,24 +263,27 @@ def call_gpt(prompt: str, doc_txt: str, transcript: str) -> str:
     }, ensure_ascii=False)
 
     user_message = prompt + "\n\nINPUT:\n" + user_input
-    # Each meeting = fresh conversation, no memory of previous meetings
-    # gpt-5.5 requires max_completion_tokens, no temperature
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {
-                "role": "system",
-                "content": "You are an expert interview analyst. Analyze the provided interview notes and transcript carefully. Each interview is independent — do not reference or remember any previous interviews."
-            },
+
+    body = json.dumps({
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 4096,
+        "messages": [
             {
                 "role": "user",
                 "content": user_message
             }
-        ],
-        max_tokens=4096,
-        temperature=0.3,
+        ]
+    })
+
+    response = bedrock_runtime.invoke_model(
+        modelId=BEDROCK_MODEL_ID,
+        body=body,
+        contentType="application/json",
+        accept="application/json"
     )
-    return response.choices[0].message.content.strip()
+
+    response_body = json.loads(response["body"].read())
+    return response_body["content"][0]["text"].strip()
 
 # ── PROCESS ONE MEETING ──
 def process_one_meeting(item: dict) -> str:
@@ -340,7 +292,7 @@ def process_one_meeting(item: dict) -> str:
 
     log.info(f"Processing meeting_id={meeting_id}")
 
-    # Find the real S3 folder for this meeting
+    # Find real S3 folder
     folder = find_meeting_folder(meeting_id)
     if not folder:
         return f"SKIP  {meeting_id} — no S3 folder found"
@@ -361,11 +313,9 @@ def process_one_meeting(item: dict) -> str:
     # Read doc.txt
     doc_txt = read_s3_text(doc_key)
     if not doc_txt:
-        # Fallback to temp doc.txt
         doc_txt = read_s3_text(f"{temp_prefix}/doc.txt")
     if not doc_txt:
         doc_txt = "(No interview notes available)"
-        log.info(f"No doc.txt for meeting_id={meeting_id}")
 
     # Skip if nothing to analyze
     if doc_txt == "(No interview notes available)" and transcript == "(No transcript available)":
@@ -376,33 +326,33 @@ def process_one_meeting(item: dict) -> str:
     if not prompt:
         return f"ERROR {meeting_id} — prompt.txt empty"
 
-    # Call GPT with retry
-    log.info(f"Calling GPT for meeting_id={meeting_id}...")
+    # Call Bedrock with retry
+    log.info(f"Calling Bedrock Claude Haiku 4.5 for meeting_id={meeting_id}...")
     llm_output = None
-    for attempt in range(3):  # 3 attempts
+    for attempt in range(3):
         try:
-            llm_output = call_gpt(prompt, doc_txt, transcript)
+            llm_output = call_bedrock(prompt, doc_txt, transcript)
             if llm_output:
                 break
             log.warning(f"Empty output attempt {attempt+1} for {meeting_id}")
         except Exception as e:
-            log.warning(f"GPT attempt {attempt+1} failed for {meeting_id}: {e}")
+            log.warning(f"Bedrock attempt {attempt+1} failed for {meeting_id}: {e}")
             if attempt < 2:
-                time.sleep(5)  # Wait 5s before retry
+                time.sleep(5)
             else:
-                return f"ERROR {meeting_id} — GPT failed after 3 attempts: {e}"
+                return f"ERROR {meeting_id} — Bedrock failed after 3 attempts: {e}"
 
     if not llm_output:
-        return f"ERROR {meeting_id} — GPT returned empty output after 3 attempts"
+        return f"ERROR {meeting_id} — Bedrock returned empty output"
 
-    # Save llm.txt to the SAME folder as transcript/docs
+    # Save llm.txt
     now_utc = datetime.now(timezone.utc)
     now_ist = (now_utc + IST_OFFSET).strftime("%Y-%m-%d %I:%M:%S %p IST")
 
     llm_content = f"""LLM ANALYSIS REPORT
 Meeting ID: {meeting_id}
 Generated At: {now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')} ({now_ist})
-Model: GPT-4o
+Model: Claude Haiku 4.5 (AWS Bedrock)
 Base Folder: s3://{S3_BUCKET}/{base_prefix}
 Doc Source: s3://{S3_BUCKET}/{doc_key}
 Transcript: s3://{S3_BUCKET}/{transcript_key or 'N/A'}
@@ -419,7 +369,7 @@ Transcript: s3://{S3_BUCKET}/{transcript_key or 'N/A'}
         "status":           "llm_processed",
         "processed_at":     now_utc.isoformat(),
         "processed_at_ist": now_ist,
-        "model":            "gpt-4o",
+        "model":            "claude-haiku-4-5 (AWS Bedrock)",
         "llm_txt":          f"s3://{S3_BUCKET}/{llm_key}",
         "doc_source":       f"s3://{S3_BUCKET}/{doc_key}",
         "transcript":       f"s3://{S3_BUCKET}/{transcript_key}" if transcript_key else "N/A",
@@ -433,7 +383,7 @@ Transcript: s3://{S3_BUCKET}/{transcript_key or 'N/A'}
 
 # ── MAIN ──
 def main():
-    log.info(f"llm_processor_worker starting — max_workers={MAX_WORKERS}")
+    log.info(f"llm_processor_worker starting — model=Claude Haiku 4.5 (Bedrock) — max_workers={MAX_WORKERS}")
 
     prompt = load_prompt()
     if not prompt:
@@ -441,11 +391,21 @@ def main():
         sys.exit(1)
     log.info(f"Prompt loaded: {len(prompt)} chars")
 
+    # Test Bedrock connection
     try:
-        get_openai_client()
-        log.info("OpenAI client initialized successfully")
+        bedrock_runtime.invoke_model(
+            modelId=BEDROCK_MODEL_ID,
+            body=json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 10,
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+            contentType="application/json",
+            accept="application/json"
+        )
+        log.info("Bedrock Claude Haiku 4.5 connection verified ✅")
     except Exception as e:
-        log.error(f"Failed to initialize OpenAI: {e}")
+        log.error(f"Bedrock connection failed: {e}")
         sys.exit(1)
 
     while True:

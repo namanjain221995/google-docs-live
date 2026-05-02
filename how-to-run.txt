@@ -2,6 +2,12 @@
 sudo journalctl -u meeting-start-worker -f
 sudo journalctl -u google-change-worker -f
 sudo journalctl -u doc-finalizer-worker -f
+sudo journalctl -u llm-processor-worker -f
+
+sudo systemctl stop llm-processor-worker
+
+python3.11 cleanup_llm.py
+
 sudo systemctl restart meeting-start-worker doc-finalizer-worker google-change-worker
 
 # Check DB for tracked meetings
