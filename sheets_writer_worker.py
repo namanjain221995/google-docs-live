@@ -60,6 +60,30 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from simple_salesforce import Salesforce
 
+# ── GLOBAL SHEETS RATE LIMITER ────────────────────────────────────────────────
+# Google Sheets quota: 60 write requests/min/user.
+# We cap at 45/min across ALL threads to stay safely under the limit.
+
+_SHEETS_RATE_LIMIT  = 45     # max writes per window
+_SHEETS_RATE_WINDOW = 60     # seconds
+_sheets_write_lock  = threading.Lock()
+_sheets_write_times = []     # timestamps of recent writes
+
+def _acquire_sheets_token():
+    """Block until a write slot is available within the rate window."""
+    while True:
+        with _sheets_write_lock:
+            now = time.time()
+            cutoff = now - _SHEETS_RATE_WINDOW
+            global _sheets_write_times
+            _sheets_write_times = [t for t in _sheets_write_times if t > cutoff]
+            if len(_sheets_write_times) < _SHEETS_RATE_LIMIT:
+                _sheets_write_times.append(now)
+                return  # token acquired
+            # wait until the oldest write leaves the window
+            wait = _sheets_write_times[0] + _SHEETS_RATE_WINDOW - now + 0.1
+        time.sleep(max(wait, 0.1))
+
 # ── CONFIG ──────────────────────────────────────────────────────────────────
 
 AWS_REGION        = os.environ.get("AWS_REGION", "us-east-1")
@@ -313,112 +337,156 @@ def parse_toon_output(toon_txt: str) -> dict:
 
 # ── GOOGLE DRIVE HELPERS ──────────────────────────────────────────────────────
 
-_drive_cache = {}   # path_key → folder_id
-_drive_cache_lock = threading.Lock()
+_drive_cache         = {}   # cache_key → id
+_drive_cache_lock    = threading.Lock()
+_folder_create_locks = {}   # cache_key → per-key Lock (prevents duplicate creates)
+_folder_locks_lock   = threading.Lock()
+
+def _get_folder_lock(cache_key: str) -> threading.Lock:
+    """Return a per-folder-key lock so only one thread creates each folder."""
+    with _folder_locks_lock:
+        if cache_key not in _folder_create_locks:
+            _folder_create_locks[cache_key] = threading.Lock()
+        return _folder_create_locks[cache_key]
 
 def find_shared_drive_id(drive_svc) -> str:
-    """Find the ID of 2026_Shared_Drive."""
-    with _drive_cache_lock:
-        if "shared_drive_id" in _drive_cache:
-            return _drive_cache["shared_drive_id"]
-
-    resp = drive_svc.drives().list(pageSize=20).execute()
-    for d in resp.get("drives", []):
-        if d["name"] == SHARED_DRIVE_NAME:
-            with _drive_cache_lock:
-                _drive_cache["shared_drive_id"] = d["id"]
-            return d["id"]
-    raise ValueError(f"Shared drive '{SHARED_DRIVE_NAME}' not found")
-
-def find_or_create_folder(drive_svc, name: str, parent_id: str, drive_id: str) -> str:
-    """Find or create a folder by name inside parent, within the shared drive."""
-    cache_key = f"{parent_id}/{name}"
+    """Find the ID of 2026_Shared_Drive. Cached after first lookup."""
+    cache_key = "shared_drive_id"
     with _drive_cache_lock:
         if cache_key in _drive_cache:
             return _drive_cache[cache_key]
 
-    q = (
-        f"name='{name}' and mimeType='application/vnd.google-apps.folder' "
-        f"and '{parent_id}' in parents and trashed=false"
-    )
-    resp = drive_svc.files().list(
-        q=q,
-        spaces="drive",
-        fields="files(id, name)",
-        includeItemsFromAllDrives=True,
-        supportsAllDrives=True,
-        corpora="drive",
-        driveId=drive_id,
-    ).execute()
+    folder_lock = _get_folder_lock(cache_key)
+    with folder_lock:
+        # Double-check after acquiring lock
+        with _drive_cache_lock:
+            if cache_key in _drive_cache:
+                return _drive_cache[cache_key]
+        resp = drive_svc.drives().list(pageSize=20).execute()
+        for d in resp.get("drives", []):
+            if d["name"] == SHARED_DRIVE_NAME:
+                with _drive_cache_lock:
+                    _drive_cache[cache_key] = d["id"]
+                return d["id"]
+        raise ValueError(f"Shared drive '{SHARED_DRIVE_NAME}' not found")
 
-    files = resp.get("files", [])
-    if files:
-        fid = files[0]["id"]
-    else:
-        meta = {
-            "name": name,
-            "mimeType": "application/vnd.google-apps.folder",
-            "parents": [parent_id],
-        }
-        f = drive_svc.files().create(
-            body=meta,
-            fields="id",
-            supportsAllDrives=True,
-        ).execute()
-        fid = f["id"]
-        log.info(f"Created folder '{name}' under parent={parent_id}")
+def find_or_create_folder(drive_svc, name: str, parent_id: str, drive_id: str) -> str:
+    """
+    Find or create a folder by name inside parent_id.
+    Uses per-key locking + double-check to prevent duplicate folder creation
+    when multiple threads run simultaneously.
+    """
+    cache_key = f"{parent_id}/{name}"
 
+    # Fast path: already cached — no lock needed
     with _drive_cache_lock:
-        _drive_cache[cache_key] = fid
-    return fid
+        if cache_key in _drive_cache:
+            return _drive_cache[cache_key]
+
+    # Slow path: serialize per folder key
+    folder_lock = _get_folder_lock(cache_key)
+    with folder_lock:
+        # Double-check: another thread may have created while we waited
+        with _drive_cache_lock:
+            if cache_key in _drive_cache:
+                return _drive_cache[cache_key]
+
+        # Search Google Drive for existing folder
+        q = (
+            f"name='{name}' and mimeType='application/vnd.google-apps.folder' "
+            f"and '{parent_id}' in parents and trashed=false"
+        )
+        resp = drive_svc.files().list(
+            q=q,
+            spaces="drive",
+            fields="files(id, name)",
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True,
+            corpora="drive",
+            driveId=drive_id,
+        ).execute()
+
+        files = resp.get("files", [])
+        if files:
+            fid = files[0]["id"]
+            if len(files) > 1:
+                log.warning(f"Found {len(files)} duplicate folders named '{name}' — using first: {fid}")
+        else:
+            meta = {
+                "name": name,
+                "mimeType": "application/vnd.google-apps.folder",
+                "parents": [parent_id],
+            }
+            f = drive_svc.files().create(
+                body=meta,
+                fields="id",
+                supportsAllDrives=True,
+            ).execute()
+            fid = f["id"]
+            log.info(f"Created folder '{name}' under parent={parent_id} → {fid}")
+
+        with _drive_cache_lock:
+            _drive_cache[cache_key] = fid
+        return fid
 
 def find_or_create_sheet(drive_svc, sheets_svc, name: str, parent_id: str, drive_id: str) -> str:
     """
     Find or create a Google Sheet by name in parent_id.
-    If created fresh, set up the 3 tabs with correct headers.
+    Uses per-key locking + double-check to prevent duplicate sheet creation.
+    If created fresh, sets up the 3 tabs with correct headers.
     Returns the spreadsheet ID.
     """
     cache_key = f"sheet:{parent_id}/{name}"
+
+    # Fast path
     with _drive_cache_lock:
         if cache_key in _drive_cache:
             return _drive_cache[cache_key]
 
-    q = (
-        f"name='{name}' and mimeType='application/vnd.google-apps.spreadsheet' "
-        f"and '{parent_id}' in parents and trashed=false"
-    )
-    resp = drive_svc.files().list(
-        q=q,
-        spaces="drive",
-        fields="files(id, name)",
-        includeItemsFromAllDrives=True,
-        supportsAllDrives=True,
-        corpora="drive",
-        driveId=drive_id,
-    ).execute()
+    # Slow path: serialize per sheet key
+    sheet_lock = _get_folder_lock(cache_key)
+    with sheet_lock:
+        # Double-check
+        with _drive_cache_lock:
+            if cache_key in _drive_cache:
+                return _drive_cache[cache_key]
 
-    files = resp.get("files", [])
-    if files:
-        sid = files[0]["id"]
-        log.info(f"Found existing sheet '{name}': {sid}")
-    else:
-        meta = {
-            "name": name,
-            "mimeType": "application/vnd.google-apps.spreadsheet",
-            "parents": [parent_id],
-        }
-        f = drive_svc.files().create(
-            body=meta,
-            fields="id",
+        q = (
+            f"name='{name}' and mimeType='application/vnd.google-apps.spreadsheet' "
+            f"and '{parent_id}' in parents and trashed=false"
+        )
+        resp = drive_svc.files().list(
+            q=q,
+            spaces="drive",
+            fields="files(id, name)",
+            includeItemsFromAllDrives=True,
             supportsAllDrives=True,
+            corpora="drive",
+            driveId=drive_id,
         ).execute()
-        sid = f["id"]
-        log.info(f"Created new sheet '{name}': {sid}")
-        setup_sheet_tabs(sheets_svc, sid)
 
-    with _drive_cache_lock:
-        _drive_cache[cache_key] = sid
-    return sid
+        files = resp.get("files", [])
+        if files:
+            sid = files[0]["id"]
+            log.info(f"Found existing sheet '{name}': {sid}")
+        else:
+            meta = {
+                "name": name,
+                "mimeType": "application/vnd.google-apps.spreadsheet",
+                "parents": [parent_id],
+            }
+            f = drive_svc.files().create(
+                body=meta,
+                fields="id",
+                supportsAllDrives=True,
+            ).execute()
+            sid = f["id"]
+            log.info(f"Created new sheet '{name}': {sid}")
+            setup_sheet_tabs(sheets_svc, sid)
+
+        with _drive_cache_lock:
+            _drive_cache[cache_key] = sid
+        return sid
 
 # ── SHEET TAB SETUP ───────────────────────────────────────────────────────────
 
@@ -507,18 +575,34 @@ def setup_sheet_tabs(sheets_svc, spreadsheet_id: str):
 # ── APPEND ROW HELPER ─────────────────────────────────────────────────────────
 
 def append_row(sheets_svc, spreadsheet_id: str, tab_name: str, row: list):
-    """Append one row to the given tab."""
-    try:
-        sheets_svc.spreadsheets().values().append(
-            spreadsheetId=spreadsheet_id,
-            range=f"'{tab_name}'!A1",
-            valueInputOption="RAW",
-            insertDataOption="INSERT_ROWS",
-            body={"values": [row]}
-        ).execute()
-    except HttpError as e:
-        log.error(f"Failed to append row to {tab_name}: {e}")
-        raise
+    """
+    Append one row to the given tab.
+    - Acquires a global rate-limiter token before each write (45 writes/min max)
+    - Retries up to 5 times with exponential backoff on HTTP 429
+    """
+    max_retries = 5
+    for attempt in range(max_retries):
+        _acquire_sheets_token()   # wait for rate-limit slot
+        try:
+            sheets_svc.spreadsheets().values().append(
+                spreadsheetId=spreadsheet_id,
+                range=f"'{tab_name}'!A1",
+                valueInputOption="RAW",
+                insertDataOption="INSERT_ROWS",
+                body={"values": [row]}
+            ).execute()
+            return  # success
+        except HttpError as e:
+            if e.resp.status == 429:
+                wait = (2 ** attempt) * 5   # 5s, 10s, 20s, 40s, 80s
+                log.warning(f"429 on {tab_name} attempt {attempt+1}/{max_retries} — sleeping {wait}s")
+                time.sleep(wait)
+                if attempt == max_retries - 1:
+                    log.error(f"append_row failed after {max_retries} retries for {tab_name}")
+                    raise
+            else:
+                log.error(f"Failed to append row to {tab_name}: {e}")
+                raise
 
 # ── NAME HELPERS ──────────────────────────────────────────────────────────────
 
