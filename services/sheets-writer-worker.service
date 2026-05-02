@@ -1,0 +1,18 @@
+[Unit]
+Description=Sheets Writer Worker — LLM output → Google Sheets
+After=network.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/google-docs-live
+EnvironmentFile=/home/ec2-user/google-docs-live/env
+ExecStart=/usr/bin/python3.11 /home/ec2-user/google-docs-live/sheets_writer_worker.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sheets-writer-worker
+
+[Install]
+WantedBy=multi-user.target
