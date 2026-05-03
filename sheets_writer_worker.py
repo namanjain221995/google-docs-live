@@ -1,40 +1,14 @@
 """
-sheets_writer_worker.py
------------------------
-Triggered after llm_processor_worker creates llm-done.json.
-
-Flow per meeting:
-1. Scan temp/live-doc-history/ for llm-done.json WITHOUT sheets-done.json
-2. Read llm-done.json → get meeting_id + base_prefix (final S3 path)
-3. Find llm.txt in final S3 path: <base_prefix>/llm/llm.txt
-4. Parse LLM JSON output
-5. Query Salesforce by Zoom Meeting ID → get Interview ID, candidate, date
-6. Extract IS person + year/month from base_prefix
-7. Navigate/create Google Drive: Interview Success → Year → Month → Sheet
-8. Write rows to correct tabs based on routing flags
-9. Write sheets-done.json to temp to mark done
-
-Key fixes:
-- llm.txt is at Interview-Success/.../llm/llm.txt (NOT in temp)
-- base_prefix comes from llm-done.json OR done.json
-- Per-key locking prevents duplicate folder creation
-- Rate limiter: 45 writes/min max to avoid 429
-- Exponential backoff retry on 429
-- Correct S3 path parsing for temp structure
+sheets_writer_worker.py — FINAL VERSION
+Handles ALL llm.txt formats:
+  FORMAT 1 - JSON     : { "audit_summary_card": {...}, "audit_metadata": {...} }
+  FORMAT 2 - Flat TOON: audit_summary_card,\n  candidate_name,John Doe\n  ...
+  FORMAT 3 - Mixed    : Header text + either JSON or Flat TOON after ===
 """
 
-import os
-import sys
-import json
-import time
-import logging
-import threading
-import queue
-import base64
-import re
+import os, sys, json, time, re, logging, threading, queue, base64
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
 import boto3
 from botocore.config import Config
 from google.oauth2 import service_account
@@ -42,482 +16,352 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from simple_salesforce import Salesforce
 
-# ── CONFIG ───────────────────────────────────────────────────────────────────
-
-AWS_REGION       = os.environ.get("AWS_REGION", "us-east-1")
-S3_BUCKET        = os.environ.get("S3_BUCKET", "zoom-automation-bucket")
-SF_SECRET_NAME   = os.environ.get("SF_SECRET_NAME", "sf/jwt/credentials")
-API_SECRET_NAME  = os.environ.get("API_SECRET_NAME", "secrets/api")
-
-SHARED_DRIVE_NAME = "2026_Shared_Drive"
-GDRIVE_FOLDER     = "Interview Success"
-
+# ── CONFIG ────────────────────────────────────────────────────────────────────
+AWS_REGION           = os.environ.get("AWS_REGION", "us-east-1")
+S3_BUCKET            = os.environ.get("S3_BUCKET", "zoom-automation-bucket")
+SF_SECRET_NAME       = os.environ.get("SF_SECRET_NAME", "sf/jwt/credentials")
+API_SECRET_NAME      = os.environ.get("API_SECRET_NAME", "secrets/api")
+SHARED_DRIVE_NAME    = "2026_Shared_Drive"
+GDRIVE_FOLDER        = "Interview Success"
+DEPARTMENTS          = ["Interview-Success", "Training", "Customer-Success", "Marketing"]
 LIVE_WORKERS         = 10
 BACKFILL_WORKERS     = 10
-LIVE_POLL_INTERVAL   = 30    # seconds
-BACKFILL_POLL_INTERVAL = 120 # seconds
-
-IST_OFFSET = timedelta(hours=5, minutes=30)
-
-GOOGLE_SCOPES = [
+LIVE_POLL_INTERVAL   = 30
+BACKFILL_INTERVAL    = 120
+IST                  = timedelta(hours=5, minutes=30)
+GOOGLE_SCOPES        = [
     "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/spreadsheets",
 ]
 
-# Departments to search for llm.txt when base_prefix is unknown
-DEPARTMENTS = ["Interview-Success", "Training", "Customer-Success", "Marketing"]
-
-# ── LOGGING ──────────────────────────────────────────────────────────────────
-
+# ── LOGGING ───────────────────────────────────────────────────────────────────
 os.makedirs("/home/ec2-user/google-docs-live/logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler(
-            "/home/ec2-user/google-docs-live/logs/sheets_writer_worker.log"
-        ),
+        logging.FileHandler("/home/ec2-user/google-docs-live/logs/sheets_writer_worker.log"),
     ],
 )
 log = logging.getLogger("sheets_writer")
 
-# ── RATE LIMITER (45 writes/min across all threads) ───────────────────────────
+# ── RATE LIMITER: 45 writes / 60s across all threads ─────────────────────────
+_RL_LIMIT = 45
+_RL_WIN   = 60
+_rl_lock  = threading.Lock()
+_rl_times = []
 
-_RATE_LIMIT  = 45
-_RATE_WINDOW = 60
-_rate_lock   = threading.Lock()
-_rate_times  = []
-
-def _acquire_write_token():
+def _token():
     while True:
-        with _rate_lock:
-            now    = time.time()
-            cutoff = now - _RATE_WINDOW
-            global _rate_times
-            _rate_times = [t for t in _rate_times if t > cutoff]
-            if len(_rate_times) < _RATE_LIMIT:
-                _rate_times.append(now)
+        with _rl_lock:
+            now = time.time()
+            global _rl_times
+            _rl_times = [t for t in _rl_times if t > now - _RL_WIN]
+            if len(_rl_times) < _RL_LIMIT:
+                _rl_times.append(now)
                 return
-            wait = _rate_times[0] + _RATE_WINDOW - now + 0.1
+            wait = _rl_times[0] + _RL_WIN - now + 0.1
         time.sleep(max(wait, 0.1))
 
-# ── LIVE QUEUE ────────────────────────────────────────────────────────────────
+# ── STATE ─────────────────────────────────────────────────────────────────────
+live_q    = queue.Queue(maxsize=500)
+_seen     = set()
+_seen_lk  = threading.Lock()
 
-live_queue  = queue.Queue(maxsize=500)
-_seen       = set()
-_seen_lock  = threading.Lock()
+# ── AWS ───────────────────────────────────────────────────────────────────────
+_bcfg = Config(max_pool_connections=100)
+s3c   = boto3.client("s3",             region_name=AWS_REGION, config=_bcfg)
+smc   = boto3.client("secretsmanager", region_name=AWS_REGION)
 
-# ── AWS CLIENTS ───────────────────────────────────────────────────────────────
+_sec_cache = {}
+_sec_lock  = threading.Lock()
 
-_boto_cfg = Config(max_pool_connections=100)
-s3  = boto3.client("s3",             region_name=AWS_REGION, config=_boto_cfg)
-sm  = boto3.client("secretsmanager", region_name=AWS_REGION)
+def get_secret(name):
+    with _sec_lock:
+        if name not in _sec_cache:
+            _sec_cache[name] = json.loads(smc.get_secret_value(SecretId=name)["SecretString"])
+        return _sec_cache[name]
 
-# ── SECRETS ───────────────────────────────────────────────────────────────────
+# ── GOOGLE ────────────────────────────────────────────────────────────────────
+_gcreds    = None
+_gcreds_lk = threading.Lock()
 
-_secrets_cache = {}
-_secrets_lock  = threading.Lock()
+def gcreds():
+    global _gcreds
+    with _gcreds_lk:
+        if _gcreds:
+            return _gcreds
+        sec    = get_secret(API_SECRET_NAME)
+        sa_raw = sec.get("service-account", sec)
+        sa     = json.loads(sa_raw) if isinstance(sa_raw, str) else sa_raw
+        _gcreds = service_account.Credentials.from_service_account_info(sa, scopes=GOOGLE_SCOPES)
+        return _gcreds
 
-def get_secret(name: str) -> dict:
-    with _secrets_lock:
-        if name in _secrets_cache:
-            return _secrets_cache[name]
-        raw = sm.get_secret_value(SecretId=name)["SecretString"]
-        parsed = json.loads(raw)
-        _secrets_cache[name] = parsed
-        return parsed
-
-# ── GOOGLE AUTH ───────────────────────────────────────────────────────────────
-
-_google_creds      = None
-_google_creds_lock = threading.Lock()
-
-def get_google_creds():
-    global _google_creds
-    with _google_creds_lock:
-        if _google_creds:
-            return _google_creds
-        secret = get_secret(API_SECRET_NAME)
-        sa_raw = secret.get("service-account", secret)
-        sa_info = json.loads(sa_raw) if isinstance(sa_raw, str) else sa_raw
-        _google_creds = service_account.Credentials.from_service_account_info(
-            sa_info, scopes=GOOGLE_SCOPES
-        )
-        return _google_creds
-
-def get_drive_service():
-    return build("drive",  "v3", credentials=get_google_creds(), cache_discovery=False)
-
-def get_sheets_service():
-    return build("sheets", "v4", credentials=get_google_creds(), cache_discovery=False)
+drive_svc_fn  = lambda: build("drive",  "v3", credentials=gcreds(), cache_discovery=False)
+sheets_svc_fn = lambda: build("sheets", "v4", credentials=gcreds(), cache_discovery=False)
 
 # ── SALESFORCE ────────────────────────────────────────────────────────────────
-
-_sf_client = None
-_sf_lock   = threading.Lock()
+_sf    = None
+_sf_lk = threading.Lock()
 
 def get_sf():
-    global _sf_client
-    with _sf_lock:
-        if _sf_client:
-            return _sf_client
-        creds = get_secret(SF_SECRET_NAME)
-        private_key = base64.b64decode(creds["PRIVATE_KEY_B64"]).decode("utf-8")
-        _sf_client = Salesforce(
-            username=creds["SF_USERNAME"],
-            consumer_key=creds["SF_CLIENT_ID"],
-            privatekey=private_key,
-            domain="login",
-        )
-        return _sf_client
+    global _sf
+    with _sf_lk:
+        if _sf:
+            return _sf
+        c   = get_secret(SF_SECRET_NAME)
+        pk  = base64.b64decode(c["PRIVATE_KEY_B64"]).decode()
+        _sf = Salesforce(username=c["SF_USERNAME"], consumer_key=c["SF_CLIENT_ID"],
+                         privatekey=pk, domain="login")
+        return _sf
 
-def query_sf_by_meeting_id(meeting_id: str) -> dict:
+def query_sf(mid):
     try:
-        sf = get_sf()
-        result = sf.query(f"""
-            SELECT Id, Name, Zoom_Meeting_Id__c,
-                   Candidate_Name__c, Company__c,
-                   Interviewer_s_Name__c, Recruiter_Name__c,
-                   Date_of_Interview__c, Round_Info__c, Round__c
-            FROM Interview__c
-            WHERE Zoom_Meeting_Id__c = '{meeting_id}'
-            LIMIT 1
-        """)
-        records = result.get("records", [])
-        if not records:
-            log.warning(f"[{meeting_id}] No SF record found")
+        res = get_sf().query(
+            f"SELECT Name,Candidate_Name__c,Date_of_Interview__c,Round_Info__c,Round__c "
+            f"FROM Interview__c WHERE Zoom_Meeting_Id__c='{mid}' LIMIT 1"
+        )
+        recs = res.get("records", [])
+        if not recs:
+            log.warning(f"[{mid}] No SF record")
             return {}
-        r = records[0]
+        r = recs[0]
         return {
-            "sf_interview_id":   r.get("Name", ""),
-            "candidate_name":    r.get("Candidate_Name__c", ""),
-            "company":           r.get("Company__c", ""),
-            "date_of_interview": r.get("Date_of_Interview__c", ""),
-            "round_info":        r.get("Round_Info__c", r.get("Round__c", "")),
-            "interviewer_name":  r.get("Interviewer_s_Name__c", ""),
+            "sf_id":   r.get("Name", ""),
+            "name":    r.get("Candidate_Name__c", ""),
+            "date":    r.get("Date_of_Interview__c", ""),
+            "round":   r.get("Round_Info__c") or r.get("Round__c", ""),
         }
     except Exception as e:
-        log.error(f"[{meeting_id}] Salesforce error: {e}")
+        log.error(f"[{mid}] SF error: {e}")
         return {}
 
 # ── S3 HELPERS ────────────────────────────────────────────────────────────────
-
-def read_s3_text(key: str) -> str:
+def s3_read(key):
     try:
-        obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
-        return obj["Body"].read().decode("utf-8")
+        return s3c.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read().decode("utf-8")
     except Exception:
         return ""
 
-def write_s3_json(key: str, data: dict):
-    s3.put_object(
-        Bucket=S3_BUCKET, Key=key,
-        Body=json.dumps(data, indent=2).encode("utf-8"),
-        ContentType="application/json",
-    )
+def s3_put_json(key, data):
+    s3c.put_object(Bucket=S3_BUCKET, Key=key,
+                   Body=json.dumps(data, indent=2).encode(),
+                   ContentType="application/json")
 
-def find_llm_txt_in_s3(meeting_id: str, base_prefix: str = "") -> tuple:
-    """
-    Find llm.txt for a meeting.
-    Returns (s3_key, base_prefix) or ("", "")
-
-    Strategy:
-    1. If base_prefix known → try <base_prefix>/llm/llm.txt directly
-    2. Search Interview-Success/<host>/.../<meeting_id>/llm/llm.txt
-    """
-    # Strategy 1: direct from base_prefix
-    if base_prefix:
-        key = f"{base_prefix}/llm/llm.txt"
-        txt = read_s3_text(key)
-        if txt:
-            return key, base_prefix
-
-    # Strategy 2: scan Interview-Success/ for the meeting_id folder
-    paginator = s3.get_paginator("list_objects_v2")
-    for dept in DEPARTMENTS:
-        prefix = f"{dept}/"
-        try:
-            for page in paginator.paginate(
-                Bucket=S3_BUCKET,
-                Prefix=prefix,
-                Delimiter="/"
-            ):
-                # We need to go deeper — search for meeting_id/llm/llm.txt
-                pass
-        except Exception:
-            continue
-
-    # Broader scan — list all llm.txt files under Interview-Success containing meeting_id
-    try:
-        for dept in DEPARTMENTS:
-            resp = s3.list_objects_v2(
-                Bucket=S3_BUCKET,
-                Prefix=f"{dept}/",
-            )
-            # This is too broad — use a targeted search instead
-            break
-    except Exception:
-        pass
-
-    # Most reliable: scan temp structure to find done.json which has base_prefix
-    return "", ""
-
-def find_base_prefix_for_meeting(meeting_id: str) -> str:
-    """
-    Scan Interview-Success/ (and other depts) to find the folder
-    that contains meeting_id in its path and has llm/llm.txt.
-    Returns the base prefix (up to and including meeting_id) or "".
-    """
-    paginator = s3.get_paginator("list_objects_v2")
+def find_llm_prefix(mid):
+    """Scan all departments to find <mid>/llm/llm.txt and return base prefix."""
+    pag = s3c.get_paginator("list_objects_v2")
     for dept in DEPARTMENTS:
         try:
-            for page in paginator.paginate(
-                Bucket=S3_BUCKET,
-                Prefix=f"{dept}/",
-            ):
+            for page in pag.paginate(Bucket=S3_BUCKET, Prefix=f"{dept}/"):
                 for obj in page.get("Contents", []):
-                    key = obj["Key"]
-                    if meeting_id in key and key.endswith("/llm/llm.txt"):
-                        # Extract base_prefix = everything up to /<meeting_id>
-                        idx = key.find(f"/{meeting_id}/")
+                    k = obj["Key"]
+                    if mid in k and k.endswith("/llm/llm.txt"):
+                        idx = k.find(f"/{mid}/")
                         if idx != -1:
-                            return key[:idx + len(f"/{meeting_id}")]
+                            return k[:idx + len(f"/{mid}")]
         except Exception as e:
-            log.warning(f"Scan error for {dept}: {e}")
-            continue
+            log.warning(f"Scan error {dept}: {e}")
     return ""
 
-# ── S3 SCANNER (temp/) ────────────────────────────────────────────────────────
+# ── S3 SCANNER ────────────────────────────────────────────────────────────────
+def scan_s3(since=None):
+    pag        = s3c.get_paginator("list_objects_v2")
+    has_llm    = {}
+    has_sheets = set()
 
-def scan_s3_for_unprocessed(since_modified=None) -> list:
-    """
-    Scan temp/live-doc-history/ for meetings that have:
-      - llm-done.json   ✅
-      - sheets-done.json ❌ (not yet processed)
-
-    Handles both path structures:
-      NEW: temp/live-doc-history/2026/Month-5/2026-05-01/<meeting_id>/file
-      OLD: temp/live-doc-history/<meeting_id>/file
-    """
-    paginator = s3.get_paginator("list_objects_v2")
-    has_llm_done    = {}   # meeting_id → {prefix, last_modified, key}
-    has_sheets_done = set()
-
-    for page in paginator.paginate(
-        Bucket=S3_BUCKET,
-        Prefix="temp/live-doc-history/"
-    ):
+    for page in pag.paginate(Bucket=S3_BUCKET, Prefix="temp/live-doc-history/"):
         for obj in page.get("Contents", []):
-            key           = obj["Key"]
-            last_modified = obj.get("LastModified")
-
-            # Remove the leading "temp/live-doc-history/" prefix
-            # key format: temp/live-doc-history/....
+            key  = obj["Key"]
+            lm   = obj.get("LastModified")
             parts = key.split("/")
-            # parts[0] = "temp"
-            # parts[1] = "live-doc-history"
-            # NEW: parts[2]=YYYY, parts[3]=Month-M, parts[4]=YYYY-MM-DD, parts[5]=meeting_id, parts[6]=file
-            # OLD: parts[2]=meeting_id, parts[3]=file
 
-            if len(parts) < 4:
-                continue
+            # NEW: temp/live-doc-history/YYYY/Month-M/YYYY-MM-DD/meeting_id/file
+            if (len(parts) >= 7
+                    and parts[2].isdigit() and len(parts[2]) == 4
+                    and parts[3].startswith("Month-")):
+                mid, fn, pfx = parts[5], parts[6], "/".join(parts[:6])
 
-            # Detect NEW structure: parts[2] is 4-digit year, parts[3] starts with Month-
-            if (parts[2].isdigit() and len(parts[2]) == 4
-                    and parts[3].startswith("Month-")
-                    and len(parts) >= 7):
-                meeting_id = parts[5]
-                filename   = parts[6]
-                prefix     = "/".join(parts[:6])   # temp/live-doc-history/YYYY/Month-M/YYYY-MM-DD/meeting_id
-
-            # OLD structure: parts[2] is meeting_id (all digits)
-            elif parts[2].isdigit() and len(parts) == 4:
-                meeting_id = parts[2]
-                filename   = parts[3]
-                prefix     = "/".join(parts[:3])   # temp/live-doc-history/meeting_id
+            # OLD: temp/live-doc-history/meeting_id/file
+            elif len(parts) == 4 and parts[2].isdigit():
+                mid, fn, pfx = parts[2], parts[3], "/".join(parts[:3])
 
             else:
                 continue
 
-            if not meeting_id.isdigit():
+            if not mid.isdigit():
                 continue
 
-            if filename == "llm-done.json":
-                if since_modified is None or (last_modified and last_modified > since_modified):
-                    has_llm_done[meeting_id] = {
-                        "prefix":        prefix,
-                        "last_modified": last_modified,
-                        "key":           key,
-                    }
-            elif filename == "sheets-done.json":
-                has_sheets_done.add(meeting_id)
+            if fn == "llm-done.json":
+                if since is None or (lm and lm > since):
+                    has_llm[mid] = {"pfx": pfx, "lm": lm}
+            elif fn == "sheets-done.json":
+                has_sheets.add(mid)
 
-    # Return meetings that need processing — newest first
-    pending = []
-    for mid, info in has_llm_done.items():
-        if mid not in has_sheets_done:
-            pending.append({
-                "meeting_id":    mid,
-                "temp_prefix":   info["prefix"],
-                "llm_done_key":  info["key"],
-                "last_modified": info["last_modified"],
-            })
-
-    pending.sort(
-        key=lambda x: x["last_modified"] or datetime.min.replace(tzinfo=timezone.utc),
-        reverse=True,
-    )
-    log.info(f"Scanner found {len(pending)} meetings to process "
-             f"({len(has_llm_done)} have llm-done, {len(has_sheets_done)} already have sheets-done)")
+    pending = [
+        {"mid": mid, "pfx": info["pfx"], "lm": info["lm"]}
+        for mid, info in has_llm.items()
+        if mid not in has_sheets
+    ]
+    pending.sort(key=lambda x: x["lm"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    log.info(f"Scanner: {len(pending)} to process "
+             f"({len(has_llm)} llm-done, {len(has_sheets)} sheets-done)")
     return pending
 
-# ── LLM OUTPUT PARSER ─────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# LLM OUTPUT PARSER — handles ALL formats
+# ══════════════════════════════════════════════════════════════════════════════
 
-def _parse_json_output(llm_txt: str) -> dict:
-    """Parse JSON format LLM output (new format)."""
-    json_start = llm_txt.find("{")
-    if json_start == -1:
-        return {}
+# ── Format 1: JSON ────────────────────────────────────────────────────────────
+def _try_json(txt):
+    """
+    Try to parse JSON format:
+    { "audit_summary_card": { "candidate_name": ..., ... }, "audit_metadata": { ... } }
+    Returns dict or None.
+    """
+    start = txt.find("{")
+    if start == -1:
+        return None
     try:
-        data = json.loads(llm_txt[json_start:])
-    except json.JSONDecodeError:
+        data = json.loads(txt[start:])
+    except Exception:
         try:
-            decoder = json.JSONDecoder()
-            data, _ = decoder.raw_decode(llm_txt[json_start:])
-        except Exception as e:
-            log.error(f"JSON parse error: {e}")
-            return {}
+            data, _ = json.JSONDecoder().raw_decode(txt[start:])
+        except Exception:
+            return None
 
-    summary_card   = data.get("audit_summary_card", {})
-    metadata       = data.get("audit_metadata", {})
-    candidate_perf = data.get("overall_candidate_performance", {})
-    proxy_perf     = data.get("overall_proxy_support_performance", {})
-    verdict_block  = data.get("final_verdict", {})
+    sc = data.get("audit_summary_card", {})
+    md = data.get("audit_metadata", {})
+    cp = data.get("overall_candidate_performance", {})
+    pp = data.get("overall_proxy_support_performance", {})
+    vd = data.get("final_verdict", {})
 
-    def join_cats(cats):
-        if isinstance(cats, list):
-            return "; ".join(
-                item.get("category", str(item)) if isinstance(item, dict) else str(item)
-                for item in cats
-            )
-        return str(cats) if cats else ""
+    if not sc and not md:
+        return None  # not the right JSON structure
+
+    def join_cats(lst):
+        if not isinstance(lst, list):
+            return str(lst) if lst else ""
+        return "; ".join(
+            (x.get("category", str(x)) if isinstance(x, dict) else str(x))
+            for x in lst
+        )
 
     return {
-        "candidate_name":                  (summary_card.get("candidate_name")
-                                            or metadata.get("candidate_detected", "")),
-        "chance_of_moving_to_next_round":  summary_card.get("chance_of_moving_to_next_round_percent", ""),
-        "candidate_action_required":       bool(summary_card.get("candidate_action_required", False)),
-        "proxy_support_action_required":   bool(summary_card.get("proxy_support_action_required", False)),
-        "candidate_action_categories":     join_cats(summary_card.get("candidate_action_categories", [])),
-        "proxy_support_action_categories": join_cats(summary_card.get("proxy_support_action_categories", [])),
-        "candidate_score":                 str(candidate_perf.get("score", "")),
-        "proxy_score":                     str(proxy_perf.get("score", "")),
-        "verdict":                         verdict_block.get("one_line_verdict", ""),
-        "round_type":                      metadata.get("round_type_detected", ""),
+        "candidate_name":                  sc.get("candidate_name") or md.get("candidate_detected", ""),
+        "chance":                          str(sc.get("chance_of_moving_to_next_round_percent", "")),
+        "candidate_action_required":       bool(sc.get("candidate_action_required", False)),
+        "proxy_support_action_required":   bool(sc.get("proxy_support_action_required", False)),
+        "candidate_action_categories":     join_cats(sc.get("candidate_action_categories", [])),
+        "proxy_support_action_categories": join_cats(sc.get("proxy_support_action_categories", [])),
+        "candidate_score":                 str(cp.get("score", "")),
+        "proxy_score":                     str(pp.get("score", "")),
+        "verdict":                         vd.get("one_line_verdict", ""),
+        "round_type":                      md.get("round_type_detected", ""),
     }
 
-def _parse_toon_output(llm_txt: str) -> dict:
+# ── Format 2: Flat TOON (comma-separated key,value) ──────────────────────────
+def _try_flat_toon(txt):
     """
-    Parse TOON format LLM output (old format).
+    Parse Flat TOON format produced by Claude Haiku 4.5 / Bedrock:
 
-    TOON uses bracketed sections like:
-      [META]
-      candidate_name: John Doe
-      round_type_detected: Technical
+    audit_metadata,
+      round_type_detected,Recruiter Screen
+      candidate_detected,John Doe (I-012345)
 
-      [SUMMARY]
-      ...
+    audit_summary_card,
+      candidate_name,John Doe
+      chance_of_moving_to_next_round_percent,75
+      candidate_action_required,true
+      proxy_support_action_required,false
+      candidate_action_categories[2],
+        Communication / Delivery,reason text
+        Confidence / Presence,reason text
 
-      [VERDICT]
-      candidate_ready_for_real_interview: yes
-      one_line_verdict: Strong candidate with minor gaps
-      ...
+    overall_candidate_performance,
+      score,75
 
-    We extract key fields using section-aware parsing.
+    one_line_verdict,"Strong candidate with minor gaps"
+
+    Returns dict or None.
     """
 
-    def get_section(text: str, section: str) -> str:
-        """Extract content between [SECTION] and next [SECTION] or end."""
-        pattern = rf"\[{re.escape(section)}\](.*?)(?=\n\[|\Z)"
-        m = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
-        return m.group(1).strip() if m else ""
+    def get_field(text, field, default=""):
+        """Match:  <field>[optional[N]],<value>"""
+        pat = rf'^\s*{re.escape(field)}(?:\[\d+\])?\s*,\s*(.+?)\s*$'
+        m = re.search(pat, text, re.MULTILINE | re.IGNORECASE)
+        return m.group(1).strip().strip('"') if m else default
 
-    def get_field(text: str, field: str, default="") -> str:
-        """Extract field: value from text."""
-        pattern = rf"^\s*{re.escape(field)}\s*[:=]\s*(.+?)$"
-        m = re.search(pattern, text, re.MULTILINE | re.IGNORECASE)
-        return m.group(1).strip() if m else default
+    def get_bool(text, field):
+        return get_field(text, field).lower() in ("true", "yes", "1")
 
-    def get_bool_field(text: str, field: str) -> bool:
-        val = get_field(text, field, "false").lower()
-        return val in ("true", "yes", "1")
+    def get_cats(text, field):
+        """
+        Extract sub-items from an array field:
+          field[N],
+            Category Name,reason...
+            Category Name,reason...
+        Stops when indent returns to header level or less.
+        """
+        pat = rf'^\s*{re.escape(field)}(?:\[\d+\])?\s*,\s*$'
+        m   = re.search(pat, text, re.MULTILINE | re.IGNORECASE)
+        if not m:
+            return ""
+        # Measure header indent
+        line_start    = text.rfind("\n", 0, m.start()) + 1
+        header_line   = text[line_start:m.end()]
+        header_indent = len(header_line) - len(header_line.lstrip())
+        cats = []
+        for line in text[m.end():].split("\n"):
+            if not line.strip():
+                continue
+            line_indent = len(line) - len(line.lstrip())
+            if line_indent <= header_indent:
+                break                              # back to same or outer level
+            stripped = line.strip()
+            if re.match(r'.+\[\d+\]\s*,\s*$', stripped):
+                break                              # another array header — stop
+            idx = stripped.find(",")
+            if idx > 0:
+                cat = stripped[:idx].strip().strip('"')
+                if cat and not cat.isdigit():
+                    cats.append(cat)
+        return "; ".join(cats)
 
-    def get_list_field(text: str, field: str) -> str:
-        """Extract a comma/semicolon/newline separated list field."""
-        val = get_field(text, field, "")
-        if not val:
-            # Try to find indented items after the field name
-            pattern = rf"^\s*{re.escape(field)}\s*[:=]\s*\n((?:\s+[-•*]?.+\n?)*)"
-            m = re.search(pattern, text, re.MULTILINE | re.IGNORECASE)
-            if m:
-                items = re.findall(r"[-•*]?\s*(.+)", m.group(1))
-                return "; ".join(i.strip() for i in items if i.strip())
-        return val
+    # Must have at least one key,value comma-separated line to qualify
+    if not re.search(r'^\s*\w[\w\s]*,\s*\S', txt, re.MULTILINE):
+        return None
 
-    meta_sec       = get_section(llm_txt, "META")
-    summary_sec    = get_section(llm_txt, "SUMMARY")
-    verdict_sec    = get_section(llm_txt, "VERDICT")
-    candidate_sec  = get_section(llm_txt, "CANDIDATE")
-    support_sec    = get_section(llm_txt, "SUPPORT")
+    candidate_name = (get_field(txt, "candidate_name")
+                      or get_field(txt, "candidate_detected"))
+    # Strip SF ID suffix like (I-025513)
+    candidate_name = re.sub(r'\s*\([A-Z]-\d+\)', '', candidate_name).strip()
 
-    # Search across whole doc for fields not in specific sections
-    full = llm_txt
+    chance = (get_field(txt, "chance_of_moving_to_next_round_percent")
+              or get_field(txt, "probability_percent"))
 
-    # candidate_name
-    candidate_name = (get_field(meta_sec, "candidate_name")
-                      or get_field(meta_sec, "candidate_detected")
-                      or get_field(full, "candidate_name")
-                      or get_field(full, "candidate_detected"))
+    cand_action  = get_bool(txt, "candidate_action_required")
+    proxy_action = get_bool(txt, "proxy_support_action_required")
 
-    # chance of moving forward
-    chance = (get_field(full, "chance_of_moving_to_next_round_percent")
-              or get_field(full, "probability_percent")
-              or get_field(full, "chance_of_moving_forward"))
+    cac = get_cats(txt, "candidate_action_categories")
+    pac = get_cats(txt, "proxy_support_action_categories")
 
-    # candidate_action_required
-    cand_action = get_bool_field(full, "candidate_action_required")
+    # Scores: first two occurrences of "score,<number>"
+    scores      = re.findall(r'^\s*score\s*,\s*(\d+)', txt, re.MULTILINE)
+    cand_score  = scores[0] if len(scores) > 0 else ""
+    proxy_score = scores[1] if len(scores) > 1 else ""
 
-    # proxy_support_action_required
-    proxy_action = get_bool_field(full, "proxy_support_action_required")
+    verdict    = get_field(txt, "one_line_verdict")
+    round_type = get_field(txt, "round_type_detected")
 
-    # candidate action categories
-    cac = (get_list_field(full, "candidate_action_categories")
-           or get_field(full, "candidate_action_categories"))
-
-    # proxy support action categories
-    pac = (get_list_field(full, "proxy_support_action_categories")
-           or get_field(full, "proxy_support_action_categories"))
-
-    # scores
-    cand_score = (get_field(candidate_sec, "score")
-                  or get_field(full, "candidate_score")
-                  or get_field(full, "score"))
-
-    proxy_score = (get_field(support_sec, "score")
-                   or get_field(full, "proxy_score"))
-
-    # verdict
-    verdict = (get_field(verdict_sec, "one_line_verdict")
-               or get_field(full, "one_line_verdict"))
-
-    # round type
-    round_type = (get_field(meta_sec, "round_type_detected")
-                  or get_field(full, "round_type_detected"))
+    # Return None if we got nothing useful
+    if not candidate_name and not chance and not verdict:
+        return None
 
     return {
         "candidate_name":                  candidate_name,
-        "chance_of_moving_to_next_round":  chance,
+        "chance":                          chance,
         "candidate_action_required":       cand_action,
         "proxy_support_action_required":   proxy_action,
         "candidate_action_categories":     cac,
@@ -528,607 +372,478 @@ def _parse_toon_output(llm_txt: str) -> dict:
         "round_type":                      round_type,
     }
 
-def parse_llm_output(llm_txt: str) -> dict:
+# ── Master parser: tries all formats ─────────────────────────────────────────
+def parse_llm(llm_txt):
     """
-    Auto-detects format (JSON or TOON) and parses accordingly.
-
-    JSON format (new): contains { ... } with audit_summary_card etc.
-    TOON format (old): uses [SECTION] bracketed sections.
+    Auto-detect format and parse.
+    Returns a flat dict with guaranteed keys, or {} if nothing works.
+    Never raises.
     """
     if not llm_txt or not llm_txt.strip():
         log.warning("llm.txt is empty")
         return {}
 
-    # Detect format: if there's a '{' that starts a JSON object
-    json_start = llm_txt.find("{")
-    if json_start != -1:
-        # Try JSON first
-        result = _parse_json_output(llm_txt)
-        if result:
-            log.info("Parsed as JSON format ✅")
-            return result
+    # Strip the report header (everything before the first blank line after ===)
+    # The header looks like:
+    #   LLM ANALYSIS REPORT
+    #   Meeting ID: ...
+    #   ...
+    #   ============================================================
+    #   <actual content>
+    body = llm_txt
+    sep_match = re.search(r'={4,}\s*\n', llm_txt)
+    if sep_match:
+        body = llm_txt[sep_match.end():]
 
-    # Try TOON format
-    if "[" in llm_txt:
-        result = _parse_toon_output(llm_txt)
-        if result.get("candidate_name") or result.get("chance_of_moving_to_next_round"):
-            log.info("Parsed as TOON format ✅")
-            return result
-
-    # Last resort: try TOON on anything
-    result = _parse_toon_output(llm_txt)
-    if any(result.values()):
-        log.info("Parsed as TOON format (fallback) ✅")
+    # ── Try JSON ──────────────────────────────────────────────────────────────
+    result = _try_json(body)
+    if result and result.get("candidate_name"):
+        log.info(f"Format=JSON ✅  candidate='{result['candidate_name']}'  "
+                 f"chance='{result['chance']}'  "
+                 f"cand_action={result['candidate_action_required']}  "
+                 f"proxy_action={result['proxy_support_action_required']}")
         return result
 
-    log.warning("Could not parse llm.txt — unknown format")
+    # Also try JSON on the full text (in case no separator)
+    result = _try_json(llm_txt)
+    if result and result.get("candidate_name"):
+        log.info(f"Format=JSON(full) ✅  candidate='{result['candidate_name']}'  "
+                 f"chance='{result['chance']}'")
+        return result
+
+    # ── Try Flat TOON ─────────────────────────────────────────────────────────
+    result = _try_flat_toon(body)
+    if result:
+        log.info(f"Format=FlatTOON ✅  candidate='{result['candidate_name']}'  "
+                 f"chance='{result['chance']}'  "
+                 f"cand_action={result['candidate_action_required']}  "
+                 f"proxy_action={result['proxy_support_action_required']}  "
+                 f"cac='{result['candidate_action_categories'][:80]}'  "
+                 f"pac='{result['proxy_support_action_categories'][:80]}'")
+        return result
+
+    # Also try Flat TOON on full text
+    result = _try_flat_toon(llm_txt)
+    if result:
+        log.info(f"Format=FlatTOON(full) ✅  candidate='{result['candidate_name']}'  "
+                 f"chance='{result['chance']}'")
+        return result
+
+    # ── Nothing worked ────────────────────────────────────────────────────────
+    log.warning(f"Could not parse llm.txt — unknown format. "
+                f"First 400 chars:\n{llm_txt[:400]}")
     return {}
 
-# ── PATH HELPERS ──────────────────────────────────────────────────────────────
+# ── Path helpers ──────────────────────────────────────────────────────────────
+def _clean(s): return s.replace("_", " ").strip()
 
-def clean_name(raw: str) -> str:
-    return raw.replace("_", " ").strip()
+def extract_is_person(bp):
+    parts = bp.split("/")
+    return _clean(parts[1]) if len(parts) >= 2 and parts[0] in DEPARTMENTS else ""
 
-def extract_is_person(base_prefix: str) -> str:
-    """
-    base_prefix: Interview-Success/Ronak_Thakar/2026/...
-    → 'Ronak Thakar'
-    """
-    parts = base_prefix.split("/")
-    if len(parts) >= 2 and parts[0] in DEPARTMENTS:
-        return clean_name(parts[1])
-    return ""
-
-def extract_year_month(base_prefix: str):
-    """
-    Returns (year_str, month_num, month_name)
-    from path like Interview-Success/Host/2026/Month-5/...
-    """
-    parts = base_prefix.split("/")
-    year = ""
-    month_folder = ""
+def extract_year_month(bp):
+    parts = bp.split("/")
+    year = month_num = ""
     for p in parts:
         if p.isdigit() and len(p) == 4:
             year = p
         elif p.startswith("Month-"):
-            month_folder = p
-    try:
-        month_num = int(month_folder.replace("Month-", ""))
-    except Exception:
-        month_num = 0
-    month_names = ["", "January", "February", "March", "April", "May", "June",
-                   "July", "August", "September", "October", "November", "December"]
-    month_name = month_names[month_num] if 0 < month_num <= 12 else "Unknown"
-    return year, month_num, month_name
+            try: month_num = int(p.replace("Month-", ""))
+            except: pass
+    names = ["","January","February","March","April","May","June",
+             "July","August","September","October","November","December"]
+    mn = names[month_num] if isinstance(month_num, int) and 0 < month_num <= 12 else "Unknown"
+    return year, mn
 
-# ── GOOGLE DRIVE: FOLDER/SHEET CREATE WITH RACE PROTECTION ───────────────────
+# ── Google Drive cache + race-safe create ─────────────────────────────────────
+_dc    = {}
+_dc_lk = threading.Lock()
+_cl    = {}
+_cl_lk = threading.Lock()
 
-_drive_cache         = {}
-_drive_cache_lock    = threading.Lock()
-_create_locks        = {}
-_create_locks_lock   = threading.Lock()
+def _lk(key):
+    with _cl_lk:
+        if key not in _cl: _cl[key] = threading.Lock()
+        return _cl[key]
 
-def _get_create_lock(key: str) -> threading.Lock:
-    with _create_locks_lock:
-        if key not in _create_locks:
-            _create_locks[key] = threading.Lock()
-        return _create_locks[key]
-
-def find_shared_drive_id(drive_svc) -> str:
-    cache_key = "__shared_drive__"
-    with _drive_cache_lock:
-        if cache_key in _drive_cache:
-            return _drive_cache[cache_key]
-
-    with _get_create_lock(cache_key):
-        with _drive_cache_lock:
-            if cache_key in _drive_cache:
-                return _drive_cache[cache_key]
-        resp = drive_svc.drives().list(pageSize=20).execute()
-        for d in resp.get("drives", []):
+def _shared_drive(dsvc):
+    k = "__sd__"
+    with _dc_lk:
+        if k in _dc: return _dc[k]
+    with _lk(k):
+        with _dc_lk:
+            if k in _dc: return _dc[k]
+        for d in dsvc.drives().list(pageSize=20).execute().get("drives", []):
             if d["name"] == SHARED_DRIVE_NAME:
-                with _drive_cache_lock:
-                    _drive_cache[cache_key] = d["id"]
+                with _dc_lk: _dc[k] = d["id"]
                 return d["id"]
         raise ValueError(f"Shared drive '{SHARED_DRIVE_NAME}' not found")
 
-def find_or_create_folder(drive_svc, name: str, parent_id: str, drive_id: str) -> str:
-    """
-    Find or create folder. Uses per-key lock + double-check to prevent
-    duplicate folder creation when multiple threads run at startup.
-    """
-    cache_key = f"folder:{parent_id}:{name}"
-
-    # Fast path
-    with _drive_cache_lock:
-        if cache_key in _drive_cache:
-            return _drive_cache[cache_key]
-
-    # Slow path — only one thread per folder key
-    with _get_create_lock(cache_key):
-        # Double-check after lock
-        with _drive_cache_lock:
-            if cache_key in _drive_cache:
-                return _drive_cache[cache_key]
-
-        # Search Drive
-        q = (
-            f"name='{name}' "
-            f"and mimeType='application/vnd.google-apps.folder' "
-            f"and '{parent_id}' in parents "
-            f"and trashed=false"
-        )
-        resp = drive_svc.files().list(
-            q=q,
-            spaces="drive",
-            fields="files(id,name)",
-            includeItemsFromAllDrives=True,
-            supportsAllDrives=True,
-            corpora="drive",
-            driveId=drive_id,
+def _folder(dsvc, name, parent, drive_id):
+    k = f"f:{parent}:{name}"
+    with _dc_lk:
+        if k in _dc: return _dc[k]
+    with _lk(k):
+        with _dc_lk:
+            if k in _dc: return _dc[k]
+        resp = dsvc.files().list(
+            q=(f"name='{name}' and mimeType='application/vnd.google-apps.folder' "
+               f"and '{parent}' in parents and trashed=false"),
+            spaces="drive", fields="files(id,name)",
+            includeItemsFromAllDrives=True, supportsAllDrives=True,
+            corpora="drive", driveId=drive_id,
         ).execute()
-
         files = resp.get("files", [])
         if files:
             fid = files[0]["id"]
-            if len(files) > 1:
-                log.warning(f"Found {len(files)} folders named '{name}' — using first ({fid})")
+            if len(files) > 1: log.warning(f"{len(files)} folders '{name}' — using first")
         else:
-            f = drive_svc.files().create(
-                body={
-                    "name": name,
-                    "mimeType": "application/vnd.google-apps.folder",
-                    "parents": [parent_id],
-                },
-                fields="id",
-                supportsAllDrives=True,
-            ).execute()
-            fid = f["id"]
+            fid = dsvc.files().create(
+                body={"name": name, "mimeType": "application/vnd.google-apps.folder",
+                      "parents": [parent]},
+                fields="id", supportsAllDrives=True,
+            ).execute()["id"]
             log.info(f"✅ Created folder '{name}' → {fid}")
-
-        with _drive_cache_lock:
-            _drive_cache[cache_key] = fid
+        with _dc_lk: _dc[k] = fid
         return fid
 
-def find_or_create_sheet(drive_svc, sheets_svc, name: str, parent_id: str, drive_id: str) -> str:
-    cache_key = f"sheet:{parent_id}:{name}"
-
-    with _drive_cache_lock:
-        if cache_key in _drive_cache:
-            return _drive_cache[cache_key]
-
-    with _get_create_lock(cache_key):
-        with _drive_cache_lock:
-            if cache_key in _drive_cache:
-                return _drive_cache[cache_key]
-
-        q = (
-            f"name='{name}' "
-            f"and mimeType='application/vnd.google-apps.spreadsheet' "
-            f"and '{parent_id}' in parents "
-            f"and trashed=false"
-        )
-        resp = drive_svc.files().list(
-            q=q,
-            spaces="drive",
-            fields="files(id,name)",
-            includeItemsFromAllDrives=True,
-            supportsAllDrives=True,
-            corpora="drive",
-            driveId=drive_id,
+def _sheet(dsvc, ssvc, name, parent, drive_id):
+    k = f"s:{parent}:{name}"
+    with _dc_lk:
+        if k in _dc: return _dc[k]
+    with _lk(k):
+        with _dc_lk:
+            if k in _dc: return _dc[k]
+        resp = dsvc.files().list(
+            q=(f"name='{name}' and mimeType='application/vnd.google-apps.spreadsheet' "
+               f"and '{parent}' in parents and trashed=false"),
+            spaces="drive", fields="files(id,name)",
+            includeItemsFromAllDrives=True, supportsAllDrives=True,
+            corpora="drive", driveId=drive_id,
         ).execute()
-
         files = resp.get("files", [])
         if files:
             sid = files[0]["id"]
-            log.info(f"Found existing sheet '{name}': {sid}")
+            log.info(f"Found sheet '{name}': {sid}")
         else:
-            f = drive_svc.files().create(
-                body={
-                    "name": name,
-                    "mimeType": "application/vnd.google-apps.spreadsheet",
-                    "parents": [parent_id],
-                },
-                fields="id",
-                supportsAllDrives=True,
-            ).execute()
-            sid = f["id"]
+            sid = dsvc.files().create(
+                body={"name": name, "mimeType": "application/vnd.google-apps.spreadsheet",
+                      "parents": [parent]},
+                fields="id", supportsAllDrives=True,
+            ).execute()["id"]
             log.info(f"✅ Created sheet '{name}': {sid}")
-            setup_sheet_tabs(sheets_svc, sid)
-
-        with _drive_cache_lock:
-            _drive_cache[cache_key] = sid
+            _setup_tabs(ssvc, sid)
+        with _dc_lk: _dc[k] = sid
         return sid
 
-# ── SHEET TAB SETUP ───────────────────────────────────────────────────────────
+# ── Sheet tab setup ───────────────────────────────────────────────────────────
+C_HDR = ["Date","Salesforce Interview ID","Candidate Name","Meeting ID",
+         "Chance of Moving to Next Round %","Action Required","Candidate Action Categories"]
+I_HDR = ["Date","Salesforce Interview ID","Interview-Success Person","Meeting ID",
+         "Chance of Moving to Next Round %","Action Required","Proxy Support Action Categories"]
+D_HDR = ["Date","Salesforce Interview ID","Candidate Name","Interview-Success Person",
+         "Meeting ID","Chance of Moving to Next Round %",
+         "Candidate Action Required","Proxy Support Action Required",
+         "Candidate Action Categories","Proxy Support Action Categories",
+         "Candidate Score","Proxy Score","Verdict","Round Type"]
 
-CANDIDATE_HEADERS = [
-    "Date", "Salesforce Interview ID", "Candidate Name", "Meeting ID",
-    "Chance of Moving to Next Round %", "Action Required",
-    "Candidate Action Categories",
-]
-IS_HEADERS = [
-    "Date", "Salesforce Interview ID", "Interview-Success Person", "Meeting ID",
-    "Chance of Moving to Next Round %", "Action Required",
-    "Proxy Support Action Categories",
-]
-DATA_HEADERS = [
-    "Date", "Salesforce Interview ID", "Candidate Name", "Interview-Success Person",
-    "Meeting ID", "Chance of Moving to Next Round %",
-    "Candidate Action Required", "Proxy Support Action Required",
-    "Candidate Action Categories", "Proxy Support Action Categories",
-    "Candidate Score", "Proxy Score", "Verdict", "Round Type",
-]
-
-def setup_sheet_tabs(sheets_svc, spreadsheet_id: str):
-    meta     = sheets_svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-    existing = meta.get("sheets", [])
-    existing_titles = [s["properties"]["title"] for s in existing]
-
-    requests = []
-    if existing:
-        first_id = existing[0]["properties"]["sheetId"]
-        if existing[0]["properties"]["title"] != "Candidate":
-            requests.append({
-                "updateSheetProperties": {
-                    "properties": {"sheetId": first_id, "title": "Candidate"},
-                    "fields": "title",
-                }
-            })
-    for tab in ["Interview-Success", "Data"]:
-        if tab not in existing_titles:
-            requests.append({"addSheet": {"properties": {"title": tab}}})
-
-    if requests:
-        sheets_svc.spreadsheets().batchUpdate(
-            spreadsheetId=spreadsheet_id,
-            body={"requests": requests},
-        ).execute()
-
-    sheets_svc.spreadsheets().values().batchUpdate(
-        spreadsheetId=spreadsheet_id,
-        body={
-            "valueInputOption": "RAW",
-            "data": [
-                {"range": "'Candidate'!A1",         "values": [CANDIDATE_HEADERS]},
-                {"range": "'Interview-Success'!A1", "values": [IS_HEADERS]},
-                {"range": "'Data'!A1",              "values": [DATA_HEADERS]},
-            ],
-        },
+def _setup_tabs(ssvc, sid):
+    meta  = ssvc.spreadsheets().get(spreadsheetId=sid).execute()
+    exist = meta.get("sheets", [])
+    titles = [s["properties"]["title"] for s in exist]
+    reqs = []
+    if exist and titles[0] != "Candidate":
+        reqs.append({"updateSheetProperties": {
+            "properties": {"sheetId": exist[0]["properties"]["sheetId"], "title": "Candidate"},
+            "fields": "title"}})
+    for t in ["Interview-Success", "Data"]:
+        if t not in titles:
+            reqs.append({"addSheet": {"properties": {"title": t}}})
+    if reqs:
+        ssvc.spreadsheets().batchUpdate(spreadsheetId=sid, body={"requests": reqs}).execute()
+    ssvc.spreadsheets().values().batchUpdate(
+        spreadsheetId=sid,
+        body={"valueInputOption": "RAW", "data": [
+            {"range": "'Candidate'!A1",         "values": [C_HDR]},
+            {"range": "'Interview-Success'!A1", "values": [I_HDR]},
+            {"range": "'Data'!A1",              "values": [D_HDR]},
+        ]},
     ).execute()
-    log.info(f"Sheet tabs set up for {spreadsheet_id}")
+    log.info(f"Tabs set up for {sid}")
 
-# ── APPEND ROW (rate-limited + retry) ────────────────────────────────────────
-
-def append_row(sheets_svc, spreadsheet_id: str, tab: str, row: list):
-    max_retries = 5
-    for attempt in range(max_retries):
-        _acquire_write_token()
+# ── Append row: rate-limited + backoff retry ──────────────────────────────────
+def _append(ssvc, sid, tab, row):
+    for attempt in range(6):
+        _token()
         try:
-            sheets_svc.spreadsheets().values().append(
-                spreadsheetId=spreadsheet_id,
-                range=f"'{tab}'!A1",
-                valueInputOption="RAW",
-                insertDataOption="INSERT_ROWS",
+            ssvc.spreadsheets().values().append(
+                spreadsheetId=sid, range=f"'{tab}'!A1",
+                valueInputOption="RAW", insertDataOption="INSERT_ROWS",
                 body={"values": [row]},
             ).execute()
             return
         except HttpError as e:
             if e.resp.status == 429:
                 wait = (2 ** attempt) * 5
-                log.warning(f"429 on tab={tab} attempt {attempt+1}/{max_retries} — sleep {wait}s")
+                log.warning(f"429 tab='{tab}' attempt {attempt+1}/6 sleep {wait}s")
                 time.sleep(wait)
-                if attempt == max_retries - 1:
-                    raise
+                if attempt == 5: raise
             else:
-                log.error(f"Sheets error on tab={tab}: {e}")
+                log.error(f"Sheets error tab='{tab}': {e}")
                 raise
 
-# ── CORE: PROCESS ONE MEETING ─────────────────────────────────────────────────
+# ── Core processor ────────────────────────────────────────────────────────────
+def process(item):
+    mid = item["mid"]
+    pfx = item["pfx"]
+    log.info(f"[{mid}] ── Processing ──")
 
-def process_one_meeting(item: dict) -> str:
-    meeting_id  = item["meeting_id"]
-    temp_prefix = item["temp_prefix"]
-
-    log.info(f"[{meeting_id}] Processing...")
-
-    # ── Step 1: Read llm-done.json ─────────────────────────────────────────
-    llm_done_raw = read_s3_text(f"{temp_prefix}/llm-done.json")
-    if not llm_done_raw:
-        return f"SKIP {meeting_id} — llm-done.json empty"
+    # 1. Read llm-done.json
+    raw = s3_read(f"{pfx}/llm-done.json")
+    if not raw:
+        return f"SKIP {mid} — no llm-done.json"
     try:
-        llm_done = json.loads(llm_done_raw)
+        llm_done = json.loads(raw)
     except Exception:
-        return f"SKIP {meeting_id} — llm-done.json parse error"
+        return f"SKIP {mid} — llm-done.json parse error"
 
-    # base_prefix may be stored directly in llm-done.json
-    base_prefix = llm_done.get("base_prefix", "")
-    log.info(f"[{meeting_id}] base_prefix from llm-done.json: '{base_prefix}'")
+    bp = llm_done.get("base_prefix", "").replace(f"s3://{S3_BUCKET}/", "").rstrip("/")
+    log.info(f"[{mid}] base_prefix='{bp}'")
 
-    # ── Step 2: If no base_prefix, read done.json ──────────────────────────
-    if not base_prefix:
-        done_raw = read_s3_text(f"{temp_prefix}/done.json")
+    # 2. Fallback: read done.json
+    if not bp:
+        done_raw = s3_read(f"{pfx}/done.json")
         if done_raw:
             try:
-                done_data   = json.loads(done_raw)
-                base_prefix = done_data.get("base_prefix", "")
-                log.info(f"[{meeting_id}] base_prefix from done.json: '{base_prefix}'")
+                bp = json.loads(done_raw).get("base_prefix", "").replace(
+                    f"s3://{S3_BUCKET}/", "").rstrip("/")
+                if bp: log.info(f"[{mid}] base_prefix from done.json: '{bp}'")
             except Exception:
                 pass
 
-    # ── Step 3: Find llm.txt ───────────────────────────────────────────────
-    llm_txt  = ""
-    llm_key  = ""
-
-    # Try direct path first: base_prefix/llm/llm.txt
-    if base_prefix:
-        # Strip s3://bucket/ prefix if present
-        bp = base_prefix.replace(f"s3://{S3_BUCKET}/", "").rstrip("/")
-        candidate_key = f"{bp}/llm/llm.txt"
-        llm_txt = read_s3_text(candidate_key)
+    # 3. Find llm.txt
+    llm_txt = llm_key = ""
+    if bp:
+        candidate = f"{bp}/llm/llm.txt"
+        llm_txt = s3_read(candidate)
         if llm_txt:
-            llm_key     = candidate_key
-            base_prefix = bp
-            log.info(f"[{meeting_id}] Found llm.txt at: {llm_key}")
+            llm_key = candidate
+            log.info(f"[{mid}] Found llm.txt: {llm_key}")
 
-    # Fallback: scan all departments for meeting_id/llm/llm.txt
     if not llm_txt:
-        log.info(f"[{meeting_id}] Scanning S3 for llm.txt...")
-        found_prefix = find_base_prefix_for_meeting(meeting_id)
-        if found_prefix:
-            base_prefix = found_prefix
-            llm_key     = f"{base_prefix}/llm/llm.txt"
-            llm_txt     = read_s3_text(llm_key)
+        log.info(f"[{mid}] Scanning S3 for llm.txt...")
+        found = find_llm_prefix(mid)
+        if found:
+            bp      = found
+            llm_key = f"{bp}/llm/llm.txt"
+            llm_txt = s3_read(llm_key)
             if llm_txt:
-                log.info(f"[{meeting_id}] Found llm.txt via scan: {llm_key}")
+                log.info(f"[{mid}] Found via scan: {llm_key}")
 
     if not llm_txt:
-        return f"SKIP {meeting_id} — llm.txt not found (base_prefix='{base_prefix}')"
+        return f"SKIP {mid} — llm.txt not found"
 
-    # ── Step 4: Parse LLM output ───────────────────────────────────────────
-    parsed = parse_llm_output(llm_txt)
+    # 4. Parse LLM output (handles ALL formats)
+    parsed = parse_llm(llm_txt)
     if not parsed:
-        return f"SKIP {meeting_id} — LLM parse empty"
+        return f"SKIP {mid} — could not parse llm.txt"
 
-    # ── Step 5: Salesforce ─────────────────────────────────────────────────
-    sf_data           = query_sf_by_meeting_id(meeting_id)
-    sf_interview_id   = sf_data.get("sf_interview_id", "")
-    candidate_name    = sf_data.get("candidate_name") or parsed.get("candidate_name", "")
-    date_of_interview = sf_data.get("date_of_interview", "")
+    # 5. Salesforce
+    sf          = query_sf(mid)
+    sf_id       = sf.get("sf_id", "")
+    cand_name   = sf.get("name") or parsed.get("candidate_name", "")
+    date_str    = sf.get("date") or (datetime.now(timezone.utc) + IST).strftime("%Y-%m-%d")
 
-    # ── Step 6: Extract path metadata ─────────────────────────────────────
-    is_person = extract_is_person(base_prefix)
-    year, month_num, month_name = extract_year_month(base_prefix)
-
+    # 6. Path metadata
+    is_person       = extract_is_person(bp)
+    year, month_name = extract_year_month(bp)
     if not year:
-        now_ist    = datetime.now(timezone.utc) + IST_OFFSET
+        now_ist    = datetime.now(timezone.utc) + IST
         year       = str(now_ist.year)
-        month_num  = now_ist.month
         month_name = now_ist.strftime("%B")
+    log.info(f"[{mid}] is_person='{is_person}' year={year} month={month_name}")
 
-    log.info(f"[{meeting_id}] is_person='{is_person}' year={year} month={month_name}")
+    # 7. Google Drive navigation
+    dsvc = drive_svc_fn()
+    ssvc = sheets_svc_fn()
+    did  = _shared_drive(dsvc)
+    isf  = _folder(dsvc, GDRIVE_FOLDER, did,  did)
+    yf   = _folder(dsvc, year,          isf,  did)
+    mf   = _folder(dsvc, month_name,    yf,   did)
+    sname = f"{month_name}_{year}"
+    sid   = _sheet(dsvc, ssvc, sname, mf, did)
 
-    # ── Step 7: Google Drive navigation ───────────────────────────────────
-    drive_svc  = get_drive_service()
-    sheets_svc = get_sheets_service()
+    # 8. Row values
+    yn           = lambda f: "Yes" if f else "No"
+    cand_action  = parsed.get("candidate_action_required", False)
+    proxy_action = parsed.get("proxy_support_action_required", False)
+    chance       = parsed.get("chance", "")
+    cac          = parsed.get("candidate_action_categories", "")
+    pac          = parsed.get("proxy_support_action_categories", "")
+    c_score      = parsed.get("candidate_score", "")
+    p_score      = parsed.get("proxy_score", "")
+    verdict      = parsed.get("verdict", "")
+    round_type   = parsed.get("round_type", "")
 
-    shared_drive_id = find_shared_drive_id(drive_svc)
-    is_folder_id    = find_or_create_folder(drive_svc, GDRIVE_FOLDER, shared_drive_id, shared_drive_id)
-    year_folder_id  = find_or_create_folder(drive_svc, year,          is_folder_id,    shared_drive_id)
-    month_folder_id = find_or_create_folder(drive_svc, month_name,    year_folder_id,  shared_drive_id)
+    # Routing
+    write_c = cand_action  or (not cand_action and not proxy_action)
+    write_i = proxy_action or (not cand_action and not proxy_action)
 
-    sheet_name      = f"{month_name}_{year}"
-    spreadsheet_id  = find_or_create_sheet(drive_svc, sheets_svc, sheet_name, month_folder_id, shared_drive_id)
+    # 9. Data tab — ALWAYS
+    _append(ssvc, sid, "Data", [
+        date_str, sf_id, cand_name, is_person, mid, str(chance),
+        yn(cand_action), yn(proxy_action),
+        cac, pac, c_score, p_score, verdict, round_type,
+    ])
+    log.info(f"[{mid}] ✅ Data written")
 
-    # ── Step 8: Build row data ─────────────────────────────────────────────
-    date_str = date_of_interview or (datetime.now(timezone.utc) + IST_OFFSET).strftime("%Y-%m-%d")
-
-    candidate_action = parsed.get("candidate_action_required", False)
-    proxy_action     = parsed.get("proxy_support_action_required", False)
-    chance_pct       = parsed.get("chance_of_moving_to_next_round", "")
-    cac_str          = parsed.get("candidate_action_categories", "")
-    pac_str          = parsed.get("proxy_support_action_categories", "")
-    candidate_score  = parsed.get("candidate_score", "")
-    proxy_score      = parsed.get("proxy_score", "")
-    verdict          = parsed.get("verdict", "")
-    round_type       = parsed.get("round_type", "")
-
-    yn = lambda flag: "Yes" if flag else "No"
-
-    # Routing logic
-    # both false → write to ALL tabs anyway (Action Required = No)
-    write_candidate = candidate_action or (not candidate_action and not proxy_action)
-    write_is        = proxy_action     or (not candidate_action and not proxy_action)
-
-    # ── Step 9: Write Data tab (ALWAYS) ───────────────────────────────────
-    data_row = [
-        date_str, sf_interview_id, candidate_name, is_person,
-        meeting_id, str(chance_pct),
-        yn(candidate_action), yn(proxy_action),
-        cac_str, pac_str,
-        candidate_score, proxy_score, verdict, round_type,
-    ]
-    append_row(sheets_svc, spreadsheet_id, "Data", data_row)
-    log.info(f"[{meeting_id}] ✅ Data tab written")
-
-    # ── Step 10: Candidate tab ─────────────────────────────────────────────
-    if write_candidate:
-        append_row(sheets_svc, spreadsheet_id, "Candidate", [
-            date_str, sf_interview_id, candidate_name, meeting_id,
-            str(chance_pct), yn(candidate_action), cac_str,
+    # 10. Candidate tab
+    if write_c:
+        _append(ssvc, sid, "Candidate", [
+            date_str, sf_id, cand_name, mid, str(chance), yn(cand_action), cac,
         ])
-        log.info(f"[{meeting_id}] ✅ Candidate tab written")
+        log.info(f"[{mid}] ✅ Candidate written")
 
-    # ── Step 11: Interview-Success tab ────────────────────────────────────
-    if write_is:
-        append_row(sheets_svc, spreadsheet_id, "Interview-Success", [
-            date_str, sf_interview_id, is_person, meeting_id,
-            str(chance_pct), yn(proxy_action), pac_str,
+    # 11. Interview-Success tab
+    if write_i:
+        _append(ssvc, sid, "Interview-Success", [
+            date_str, sf_id, is_person, mid, str(chance), yn(proxy_action), pac,
         ])
-        log.info(f"[{meeting_id}] ✅ Interview-Success tab written")
+        log.info(f"[{mid}] ✅ Interview-Success written")
 
-    # ── Step 12: Write sheets-done.json ───────────────────────────────────
-    now_utc = datetime.now(timezone.utc)
-    write_s3_json(f"{temp_prefix}/sheets-done.json", {
-        "meeting_id":       meeting_id,
+    # 12. Mark done
+    now = datetime.now(timezone.utc)
+    s3_put_json(f"{pfx}/sheets-done.json", {
+        "meeting_id":       mid,
         "status":           "sheets_written",
-        "processed_at":     now_utc.isoformat(),
-        "processed_at_ist": (now_utc + IST_OFFSET).strftime("%Y-%m-%d %I:%M:%S %p IST"),
-        "spreadsheet_id":   spreadsheet_id,
-        "sheet_name":       sheet_name,
+        "processed_at":     now.isoformat(),
+        "processed_at_ist": (now + IST).strftime("%Y-%m-%d %I:%M:%S %p IST"),
+        "spreadsheet_id":   sid,
+        "sheet_name":       sname,
         "llm_key":          llm_key,
-        "base_prefix":      base_prefix,
-        "tabs_written": {
-            "Data":              True,
-            "Candidate":         write_candidate,
-            "Interview-Success": write_is,
-        },
-        "routing_reason": (
-            "both_true"      if (candidate_action and proxy_action) else
-            "candidate_only" if candidate_action else
-            "proxy_only"     if proxy_action else
-            "both_false"
-        ),
-        "sf_interview_id": sf_interview_id,
-        "candidate_name":  candidate_name,
-        "is_person":       is_person,
+        "base_prefix":      bp,
+        "tabs_written":     {"Data": True, "Candidate": write_c, "Interview-Success": write_i},
+        "routing_reason":   ("both_true"      if (cand_action and proxy_action) else
+                             "candidate_only" if cand_action else
+                             "proxy_only"     if proxy_action else
+                             "both_false"),
+        "sf_interview_id":  sf_id,
+        "candidate_name":   cand_name,
+        "is_person":        is_person,
     })
-    log.info(f"[{meeting_id}] ✅ sheets-done.json written")
-    return f"OK {meeting_id} → {sheet_name} | spreadsheet={spreadsheet_id}"
+    log.info(f"[{mid}] ✅ sheets-done.json written")
+    return f"OK {mid} → {sname} | {sid}"
 
-# ── LIVE POLLER ───────────────────────────────────────────────────────────────
-
+# ── Live poller ───────────────────────────────────────────────────────────────
 def live_poller():
     log.info("Live poller started")
-    last_checked = datetime.now(timezone.utc) - timedelta(minutes=10)
+    last = datetime.now(timezone.utc) - timedelta(minutes=10)
     while True:
         try:
-            items = scan_s3_for_unprocessed(since_modified=last_checked)
-            last_checked = datetime.now(timezone.utc)
-            new = 0
+            items = scan_s3(since=last)
+            last  = datetime.now(timezone.utc)
+            new   = 0
             for item in items:
-                mid = item["meeting_id"]
-                with _seen_lock:
-                    if mid not in _seen:
-                        _seen.add(mid)
-                        try:
-                            live_queue.put_nowait(item)
-                            new += 1
-                        except queue.Full:
-                            log.warning(f"Live queue full — dropping {mid}")
-            if new:
-                log.info(f"Live poller: queued {new} new meetings")
+                with _seen_lk:
+                    if item["mid"] not in _seen:
+                        _seen.add(item["mid"])
+                        try: live_q.put_nowait(item); new += 1
+                        except queue.Full: log.warning(f"Queue full — dropping {item['mid']}")
+            if new: log.info(f"Live poller: queued {new}")
         except Exception as e:
             log.error(f"Live poller error: {e}", exc_info=True)
         time.sleep(LIVE_POLL_INTERVAL)
 
-# ── LIVE WORKERS ──────────────────────────────────────────────────────────────
-
-def live_worker_loop():
+# ── Live workers ──────────────────────────────────────────────────────────────
+def live_worker():
     log.info("Live worker ready")
     while True:
         try:
-            item = live_queue.get(timeout=60)
+            item = live_q.get(timeout=60)
             try:
-                result = process_one_meeting(item)
-                log.info(f"[LIVE] {result}")
+                log.info(f"[LIVE] {process(item)}")
             except Exception as e:
-                log.error(f"[LIVE] Error {item['meeting_id']}: {e}", exc_info=True)
+                log.error(f"[LIVE] Error {item['mid']}: {e}", exc_info=True)
             finally:
-                live_queue.task_done()
+                live_q.task_done()
         except queue.Empty:
             continue
         except Exception as e:
             log.error(f"Live worker error: {e}", exc_info=True)
 
-# ── BACKFILL LOOP ─────────────────────────────────────────────────────────────
-
+# ── Backfill loop ─────────────────────────────────────────────────────────────
 def backfill_loop():
     log.info("Backfill loop started")
-    time.sleep(15)  # Let live workers start first
+    time.sleep(15)
     while True:
         try:
-            items = scan_s3_for_unprocessed()
             pending = []
-            for item in items:
-                mid = item["meeting_id"]
-                with _seen_lock:
-                    if mid not in _seen:
-                        _seen.add(mid)
+            for item in scan_s3():
+                with _seen_lk:
+                    if item["mid"] not in _seen:
+                        _seen.add(item["mid"])
                         pending.append(item)
 
             if not pending:
-                log.info(f"Backfill: nothing to process. Sleeping {BACKFILL_POLL_INTERVAL}s")
-                time.sleep(BACKFILL_POLL_INTERVAL)
+                log.info(f"Backfill: nothing new. Sleeping {BACKFILL_INTERVAL}s")
+                time.sleep(BACKFILL_INTERVAL)
                 continue
 
             log.info(f"Backfill: processing {len(pending)} meetings")
-            with ThreadPoolExecutor(
-                max_workers=BACKFILL_WORKERS,
-                thread_name_prefix="backfill"
-            ) as ex:
-                futures = {ex.submit(process_one_meeting, item): item["meeting_id"] for item in pending}
+            with ThreadPoolExecutor(max_workers=BACKFILL_WORKERS,
+                                    thread_name_prefix="backfill") as ex:
+                futures = {ex.submit(process, item): item["mid"] for item in pending}
                 for future in as_completed(futures):
                     mid = futures[future]
                     try:
-                        result = future.result()
-                        log.info(f"[BACKFILL] {result}")
+                        log.info(f"[BACKFILL] {future.result()}")
                     except Exception as e:
                         log.error(f"[BACKFILL] Error {mid}: {e}", exc_info=True)
 
-            log.info(f"Backfill batch done. Sleeping {BACKFILL_POLL_INTERVAL}s")
-            time.sleep(BACKFILL_POLL_INTERVAL)
-
+            log.info(f"Backfill done. Sleeping {BACKFILL_INTERVAL}s")
+            time.sleep(BACKFILL_INTERVAL)
         except Exception as e:
-            log.error(f"Backfill loop error: {e}", exc_info=True)
+            log.error(f"Backfill error: {e}", exc_info=True)
             time.sleep(30)
 
-# ── MAIN ──────────────────────────────────────────────────────────────────────
-
+# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
+    log.info("=" * 60)
     log.info("sheets_writer_worker starting")
+    log.info("=" * 60)
 
     try:
-        get_google_creds()
+        gcreds()
         log.info("Google credentials ✅")
     except Exception as e:
-        log.error(f"Google credentials failed: {e}")
-        sys.exit(1)
+        log.error(f"Google creds failed: {e}"); sys.exit(1)
 
     try:
         get_sf()
         log.info("Salesforce ✅")
     except Exception as e:
-        log.error(f"Salesforce failed: {e}")
-        sys.exit(1)
+        log.error(f"Salesforce failed: {e}"); sys.exit(1)
 
     try:
-        drive_svc = get_drive_service()
-        sid = find_shared_drive_id(drive_svc)
-        log.info(f"Shared drive '{SHARED_DRIVE_NAME}': {sid} ✅")
+        sd_id = _shared_drive(drive_svc_fn())
+        log.info(f"Shared drive '{SHARED_DRIVE_NAME}': {sd_id} ✅")
     except Exception as e:
-        log.error(f"Shared drive not found: {e}")
-        sys.exit(1)
+        log.error(f"Shared drive not found: {e}"); sys.exit(1)
 
-    # Start live poller
-    threading.Thread(target=live_poller, daemon=True, name="live-poller").start()
-
-    # Start backfill loop
+    threading.Thread(target=live_poller,   daemon=True, name="live-poller").start()
     threading.Thread(target=backfill_loop, daemon=True, name="backfill-loop").start()
 
-    # Start live worker threads
-    live_threads = []
+    threads = []
     for i in range(LIVE_WORKERS):
-        t = threading.Thread(target=live_worker_loop, daemon=True, name=f"live-{i+1}")
-        t.start()
-        live_threads.append(t)
+        t = threading.Thread(target=live_worker, daemon=True, name=f"live-{i+1}")
+        t.start(); threads.append(t)
 
-    log.info(f"All workers started: {LIVE_WORKERS} live + {BACKFILL_WORKERS} backfill")
+    log.info(f"All workers started — {LIVE_WORKERS} live + {BACKFILL_WORKERS} backfill")
 
     while True:
         time.sleep(60)
-        alive = sum(1 for t in live_threads if t.is_alive())
-        log.info(f"Heartbeat — live_workers={alive} queue={live_queue.qsize()}")
+        alive = sum(1 for t in threads if t.is_alive())
+        log.info(f"Heartbeat — live={alive} queue={live_q.qsize()}")
 
 if __name__ == "__main__":
     main()
