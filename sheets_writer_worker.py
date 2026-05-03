@@ -374,14 +374,10 @@ def scan_s3_for_unprocessed(since_modified=None) -> list:
 
 # ── LLM OUTPUT PARSER ─────────────────────────────────────────────────────────
 
-def parse_llm_output(llm_txt: str) -> dict:
-    """
-    Parse llm.txt which contains a header then JSON.
-    Strips header (everything before first '{') and parses JSON.
-    """
+def _parse_json_output(llm_txt: str) -> dict:
+    """Parse JSON format LLM output (new format)."""
     json_start = llm_txt.find("{")
     if json_start == -1:
-        log.warning("No JSON found in llm.txt")
         return {}
     try:
         data = json.loads(llm_txt[json_start:])
@@ -397,9 +393,9 @@ def parse_llm_output(llm_txt: str) -> dict:
     metadata       = data.get("audit_metadata", {})
     candidate_perf = data.get("overall_candidate_performance", {})
     proxy_perf     = data.get("overall_proxy_support_performance", {})
-    verdict        = data.get("final_verdict", {})
+    verdict_block  = data.get("final_verdict", {})
 
-    def join_categories(cats):
+    def join_cats(cats):
         if isinstance(cats, list):
             return "; ".join(
                 item.get("category", str(item)) if isinstance(item, dict) else str(item)
@@ -413,13 +409,160 @@ def parse_llm_output(llm_txt: str) -> dict:
         "chance_of_moving_to_next_round":  summary_card.get("chance_of_moving_to_next_round_percent", ""),
         "candidate_action_required":       bool(summary_card.get("candidate_action_required", False)),
         "proxy_support_action_required":   bool(summary_card.get("proxy_support_action_required", False)),
-        "candidate_action_categories":     join_categories(summary_card.get("candidate_action_categories", [])),
-        "proxy_support_action_categories": join_categories(summary_card.get("proxy_support_action_categories", [])),
+        "candidate_action_categories":     join_cats(summary_card.get("candidate_action_categories", [])),
+        "proxy_support_action_categories": join_cats(summary_card.get("proxy_support_action_categories", [])),
         "candidate_score":                 str(candidate_perf.get("score", "")),
         "proxy_score":                     str(proxy_perf.get("score", "")),
-        "verdict":                         verdict.get("one_line_verdict", ""),
+        "verdict":                         verdict_block.get("one_line_verdict", ""),
         "round_type":                      metadata.get("round_type_detected", ""),
     }
+
+def _parse_toon_output(llm_txt: str) -> dict:
+    """
+    Parse TOON format LLM output (old format).
+
+    TOON uses bracketed sections like:
+      [META]
+      candidate_name: John Doe
+      round_type_detected: Technical
+
+      [SUMMARY]
+      ...
+
+      [VERDICT]
+      candidate_ready_for_real_interview: yes
+      one_line_verdict: Strong candidate with minor gaps
+      ...
+
+    We extract key fields using section-aware parsing.
+    """
+
+    def get_section(text: str, section: str) -> str:
+        """Extract content between [SECTION] and next [SECTION] or end."""
+        pattern = rf"\[{re.escape(section)}\](.*?)(?=\n\[|\Z)"
+        m = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+        return m.group(1).strip() if m else ""
+
+    def get_field(text: str, field: str, default="") -> str:
+        """Extract field: value from text."""
+        pattern = rf"^\s*{re.escape(field)}\s*[:=]\s*(.+?)$"
+        m = re.search(pattern, text, re.MULTILINE | re.IGNORECASE)
+        return m.group(1).strip() if m else default
+
+    def get_bool_field(text: str, field: str) -> bool:
+        val = get_field(text, field, "false").lower()
+        return val in ("true", "yes", "1")
+
+    def get_list_field(text: str, field: str) -> str:
+        """Extract a comma/semicolon/newline separated list field."""
+        val = get_field(text, field, "")
+        if not val:
+            # Try to find indented items after the field name
+            pattern = rf"^\s*{re.escape(field)}\s*[:=]\s*\n((?:\s+[-•*]?.+\n?)*)"
+            m = re.search(pattern, text, re.MULTILINE | re.IGNORECASE)
+            if m:
+                items = re.findall(r"[-•*]?\s*(.+)", m.group(1))
+                return "; ".join(i.strip() for i in items if i.strip())
+        return val
+
+    meta_sec       = get_section(llm_txt, "META")
+    summary_sec    = get_section(llm_txt, "SUMMARY")
+    verdict_sec    = get_section(llm_txt, "VERDICT")
+    candidate_sec  = get_section(llm_txt, "CANDIDATE")
+    support_sec    = get_section(llm_txt, "SUPPORT")
+
+    # Search across whole doc for fields not in specific sections
+    full = llm_txt
+
+    # candidate_name
+    candidate_name = (get_field(meta_sec, "candidate_name")
+                      or get_field(meta_sec, "candidate_detected")
+                      or get_field(full, "candidate_name")
+                      or get_field(full, "candidate_detected"))
+
+    # chance of moving forward
+    chance = (get_field(full, "chance_of_moving_to_next_round_percent")
+              or get_field(full, "probability_percent")
+              or get_field(full, "chance_of_moving_forward"))
+
+    # candidate_action_required
+    cand_action = get_bool_field(full, "candidate_action_required")
+
+    # proxy_support_action_required
+    proxy_action = get_bool_field(full, "proxy_support_action_required")
+
+    # candidate action categories
+    cac = (get_list_field(full, "candidate_action_categories")
+           or get_field(full, "candidate_action_categories"))
+
+    # proxy support action categories
+    pac = (get_list_field(full, "proxy_support_action_categories")
+           or get_field(full, "proxy_support_action_categories"))
+
+    # scores
+    cand_score = (get_field(candidate_sec, "score")
+                  or get_field(full, "candidate_score")
+                  or get_field(full, "score"))
+
+    proxy_score = (get_field(support_sec, "score")
+                   or get_field(full, "proxy_score"))
+
+    # verdict
+    verdict = (get_field(verdict_sec, "one_line_verdict")
+               or get_field(full, "one_line_verdict"))
+
+    # round type
+    round_type = (get_field(meta_sec, "round_type_detected")
+                  or get_field(full, "round_type_detected"))
+
+    return {
+        "candidate_name":                  candidate_name,
+        "chance_of_moving_to_next_round":  chance,
+        "candidate_action_required":       cand_action,
+        "proxy_support_action_required":   proxy_action,
+        "candidate_action_categories":     cac,
+        "proxy_support_action_categories": pac,
+        "candidate_score":                 cand_score,
+        "proxy_score":                     proxy_score,
+        "verdict":                         verdict,
+        "round_type":                      round_type,
+    }
+
+def parse_llm_output(llm_txt: str) -> dict:
+    """
+    Auto-detects format (JSON or TOON) and parses accordingly.
+
+    JSON format (new): contains { ... } with audit_summary_card etc.
+    TOON format (old): uses [SECTION] bracketed sections.
+    """
+    if not llm_txt or not llm_txt.strip():
+        log.warning("llm.txt is empty")
+        return {}
+
+    # Detect format: if there's a '{' that starts a JSON object
+    json_start = llm_txt.find("{")
+    if json_start != -1:
+        # Try JSON first
+        result = _parse_json_output(llm_txt)
+        if result:
+            log.info("Parsed as JSON format ✅")
+            return result
+
+    # Try TOON format
+    if "[" in llm_txt:
+        result = _parse_toon_output(llm_txt)
+        if result.get("candidate_name") or result.get("chance_of_moving_to_next_round"):
+            log.info("Parsed as TOON format ✅")
+            return result
+
+    # Last resort: try TOON on anything
+    result = _parse_toon_output(llm_txt)
+    if any(result.values()):
+        log.info("Parsed as TOON format (fallback) ✅")
+        return result
+
+    log.warning("Could not parse llm.txt — unknown format")
+    return {}
 
 # ── PATH HELPERS ──────────────────────────────────────────────────────────────
 
