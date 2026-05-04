@@ -272,103 +272,147 @@ def _to_bool(s: str) -> bool:
 
 def _extract_categories_flat_toon(text: str, field_name: str) -> str:
     """
-    Extract category names from Flat TOON for fields like:
-      candidate_action_categories[1]{category,"Technical Depth",reason,"..."}
-      candidate_action_categories[2],
-        Technical Depth,reason text
-      candidate_action_categories[1],
-        - 
-          category,Technical Depth
+    Extract category names from Flat TOON. Handles ALL known formats:
 
-    Returns semicolon-joined category names like:
-      "Technical Depth; Communication / Delivery"
+    FORMAT A — inline brace with real category value:
+      candidate_action_categories[1]{category,"Technical Depth",reason,"..."}
+
+    FORMAT B — {category,reason} SCHEMA HEADER then CSV lines (new Bedrock format):
+      candidate_action_categories[3]{category,reason},
+        Communication / Delivery,"Severe audio lag...",
+        Problem Solving / Thinking Aloud,"Candidate jumped...",
+        Confidence / Presence,"Candidate frequently..."
+
+    FORMAT C — array header [N], then indented Name,reason lines:
+      candidate_action_categories[2],
+        Technical Depth,needs improvement
+        Communication / Delivery,needs work
+
+    FORMAT D — category sub-field inside block:
+      candidate_action_categories[1],
+        -
+          category,Technical Depth
     """
     cats = []
-    field_lower = field_name.lower()
 
-    # ── Pattern A: inline brace format ───────────────────────────────────────
-    # candidate_action_categories[1]{category,"Technical Depth",reason,"..."}
-    pat_brace = re.compile(
-        rf'{re.escape(field_name)}\[\d+\]\{{([^}}]+)\}}',
-        re.IGNORECASE | re.MULTILINE,
+    # Known schema/field keywords — if captured as "category", it's a header not a value
+    SCHEMA_WORDS = {
+        'reason', 'why', 'explanation', 'priority', 'problem_observed',
+        'what_to_do_next_time', 'example_better_response_or_behavior',
+        'problem', 'action', 'fix', 'severity', 'impact', 'timestamp',
+        'document_version_or_phase', 'category', 'name', 'type',
+    }
+
+    # ── FORMAT A: inline brace {category,"Real Name",reason,"..."} ───────────
+    # Only if captured value is NOT a schema keyword (distinguishes from FORMAT B header)
+    pat_a = re.compile(
+        rf'{re.escape(field_name)}\[\d+\]\{{[^}}]*?category\s*,\s*"?([^",\}}]+)"?',
+        re.IGNORECASE,
     )
-    for m in pat_brace.finditer(text):
-        inner = m.group(1)
-        # Find category,"Value" or category,Value
-        cm = re.search(
-            r'category\s*,\s*"?([^",\}]+)"?', inner, re.IGNORECASE
-        )
-        if cm:
-            cats.append(cm.group(1).strip().strip('"'))
-
+    for m in pat_a.finditer(text):
+        val = m.group(1).strip().strip('"').strip()
+        if val and val.lower() not in SCHEMA_WORDS:
+            cats.append(val)
     if cats:
-        return "; ".join(dict.fromkeys(cats))  # deduplicate, preserve order
+        return "; ".join(dict.fromkeys(cats))
 
-    # ── Pattern B: array header then indented items ───────────────────────────
-    # candidate_action_categories[N],
-    #   Category Name,reason text
-    pat_header = re.compile(
-        rf'^\s*{re.escape(field_name)}(?:\[\d+\])?\s*,\s*$',
+    # ── FORMAT B: {category,reason} SCHEMA HEADER then CSV data lines ────────
+    # Matches: field[N]{category,reason},   <- header defining column schema
+    #   Category Name,"reason text",        <- data rows
+    pat_b = re.compile(
+        rf'^\s*{re.escape(field_name)}(?:\[\d+\])?\{{[^}}]*category[^}}]*reason[^}}]*\}}\s*,\s*$',
         re.IGNORECASE | re.MULTILINE,
     )
-    for m in pat_header.finditer(text):
-        # get indent of this header line
-        line_start    = text.rfind("\n", 0, m.start()) + 1
-        header_line   = text[line_start: text.find("\n", m.start())]
+    m_b = pat_b.search(text)
+    if m_b:
+        line_start    = text.rfind("\n", 0, m_b.start()) + 1
+        header_line   = text[line_start: text.find("\n", m_b.start())]
         header_indent = len(header_line) - len(header_line.lstrip())
-
-        after = text[m.end():]
+        after = text[m_b.end():]
         for line in after.split("\n"):
             if not line.strip():
                 continue
             line_indent = len(line) - len(line.lstrip())
             if line_indent <= header_indent:
-                break  # back to outer level
+                break
+            stripped = line.strip()
+            if not stripped:
+                continue
+            # Each data line: Category Name,"reason text",
+            # Extract first value before first unquoted comma
+            first_comma = -1
+            in_quote = False
+            qchar = None
+            for ci, ch in enumerate(stripped):
+                if not in_quote and ch in ('"', "'"):
+                    in_quote = True
+                    qchar = ch
+                elif in_quote and ch == qchar:
+                    in_quote = False
+                    qchar = None
+                elif not in_quote and ch == ',':
+                    first_comma = ci
+                    break
+            if first_comma > 0:
+                cat = _strip_quotes(stripped[:first_comma])
+            else:
+                cat = _strip_quotes(stripped.rstrip(','))
+            if cat and not cat.isdigit() and len(cat) > 1 and cat.lower() not in SCHEMA_WORDS:
+                cats.append(cat)
+        if cats:
+            return "; ".join(dict.fromkeys(cats))
 
+    # ── FORMAT C: [N], header then indented Name,reason lines ────────────────
+    pat_c = re.compile(
+        rf'^\s*{re.escape(field_name)}(?:\[\d+\])?\s*,\s*$',
+        re.IGNORECASE | re.MULTILINE,
+    )
+    for m_c in pat_c.finditer(text):
+        line_start    = text.rfind("\n", 0, m_c.start()) + 1
+        header_line   = text[line_start: text.find("\n", m_c.start())]
+        header_indent = len(header_line) - len(header_line.lstrip())
+        after = text[m_c.end():]
+        for line in after.split("\n"):
+            if not line.strip():
+                continue
+            line_indent = len(line) - len(line.lstrip())
+            if line_indent <= header_indent:
+                break
             stripped = line.strip().lstrip("- ").strip()
-
-            # Skip yaml-like markers and sub-fields
             if not stripped or stripped.startswith("#"):
                 continue
-            if re.match(r'^(reason|why|explanation|details?)\s*,', stripped, re.I):
+            if re.match(r'^(reason|why|explanation|details?|priority)\s*,', stripped, re.I):
                 continue
-            if re.match(r'^\w[\w\s]*\[\d+\]\s*,\s*$', stripped):
-                break  # another array header — stop
-
-            # Extract category: "Name,reason..." or just "Name"
+            if re.match(r'^\w[\w\s]*\[\d+\]\s*[,{]', stripped):
+                break
             idx = stripped.find(",")
             if idx > 0:
                 cat = _strip_quotes(stripped[:idx])
             else:
                 cat = _strip_quotes(stripped)
-
-            if cat and not cat.isdigit() and len(cat) > 1:
+            if cat and not cat.isdigit() and len(cat) > 1 and cat.lower() not in SCHEMA_WORDS:
                 cats.append(cat)
-
     if cats:
         return "; ".join(dict.fromkeys(cats))
 
-    # ── Pattern C: category,Value sub-field inside block ─────────────────────
-    # Find the field block and look for   category,<Value>  inside it
+    # ── FORMAT D: category,<Value> sub-field inside block ────────────────────
     block_pat = re.compile(
         rf'^\s*{re.escape(field_name)}(?:\[\d+\])?\s*[,{{]',
         re.IGNORECASE | re.MULTILINE,
     )
-    for m in block_pat.finditer(text):
-        after = text[m.end():]
-        # Scan up to 20 lines for category, sub-fields
+    for m_d in block_pat.finditer(text):
+        after = text[m_d.end():]
         for i, line in enumerate(after.split("\n")):
-            if i > 20:
+            if i > 30:
                 break
             cm = re.match(
                 r'^\s*(?:-\s*)?category\s*,\s*(.+)$', line, re.IGNORECASE
             )
             if cm:
-                cats.append(_strip_quotes(cm.group(1)))
-
+                val = _strip_quotes(cm.group(1))
+                if val and val.lower() not in SCHEMA_WORDS:
+                    cats.append(val)
     return "; ".join(dict.fromkeys(cats)) if cats else ""
-
-
 def _get_field_flat_toon(text: str, field_name: str, default: str = "") -> str:
     """
     Extract a simple scalar value from flat TOON text.
