@@ -1,16 +1,22 @@
 """
 llm_processor_worker.py
------------------------
-Scans S3 for meetings that have done.json but no llm-done.json.
-Uses AWS Bedrock Claude Haiku 4.5 for LLM analysis.
+=======================
+LLM Analysis Worker — AWS Bedrock Claude Haiku 4.5
 
-For each meeting:
-1. Searches ALL of Interview-Success for /<meeting_id>/
-2. Finds the EXACT folder that has TRANSCRIPT/*.vtt
-3. Uses THAT same folder for doc.txt, transcript, llm output
-4. Creates llm-done.json in temp
+NEW: Transcript wait logic
+  - Before running LLM, checks if TRANSCRIPT/*.vtt exists in S3
+  - If no transcript: writes llm-retry.json, skips this cycle
+  - Retries every ~10 minutes, max 6 retries (~60 min total)
+  - After 6 retries with no transcript: writes llm-error.json, skips forever
+  - Scanner also skips meetings with llm-error.json
 
-Uses 30 parallel workers. Newest meetings processed first.
+S3 temp files:
+  state.json       — created by meeting_start_worker
+  doc.txt          — created by google_change_worker
+  done.json        — created by doc_finalizer_worker (trigger)
+  llm-retry.json   — NEW: retry counter + timestamps
+  llm-done.json    — created on LLM success
+  llm-error.json   — NEW: permanent failure (transcript never arrived)
 """
 
 import os
@@ -20,427 +26,643 @@ import time
 import logging
 import threading
 import boto3
+import base64
 from botocore.config import Config
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ── CONFIG ──
-AWS_REGION      = os.environ.get("AWS_REGION", "us-east-1")
-S3_BUCKET       = os.environ.get("S3_BUCKET", "zoom-automation-bucket")
-PROMPT_FILE     = os.environ.get("PROMPT_FILE",
-    "/home/ec2-user/google-docs-live/prompt.txt")
-MAX_WORKERS     = 30
-POLL_INTERVAL   = 60
-IST_OFFSET      = timedelta(hours=5, minutes=30)
-DEPARTMENTS     = ["Interview-Success", "Training", "Customer-Success", "Marketing"]
+# ── CONFIG ────────────────────────────────────────────────────────────────────
+AWS_REGION   = os.environ.get("AWS_REGION", "us-east-1")
+S3_BUCKET    = os.environ.get("S3_BUCKET", "zoom-automation-bucket")
+SF_SECRET    = os.environ.get("SF_SECRET_NAME", "sf/jwt/credentials")
+API_SECRET   = os.environ.get("API_SECRET_NAME", "secrets/api")
+PROMPT_FILE  = os.environ.get("PROMPT_FILE",
+               "/home/ec2-user/google-docs-live/prompt.txt")
 
-# Bedrock model
-BEDROCK_MODEL_ID = "anthropic.claude-haiku-4-5-20251001"
+BEDROCK_MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+MAX_OUTPUT_TOKENS = 8192
+BACKFILL_WORKERS  = 30
+SCAN_INTERVAL     = 120   # seconds between backfill scans
+IST_OFFSET        = timedelta(hours=5, minutes=30)
 
-# ── LOGGING ──
+# ── TRANSCRIPT RETRY CONFIG ───────────────────────────────────────────────────
+MAX_TRANSCRIPT_RETRIES  = 6     # max attempts waiting for transcript
+RETRY_WAIT_MINUTES      = 10    # minutes between retries
+# Total max wait = 6 × 10 = 60 minutes
+
+# ── LOGGING ───────────────────────────────────────────────────────────────────
 os.makedirs("/home/ec2-user/google-docs-live/logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("/home/ec2-user/google-docs-live/logs/llm_processor_worker.log"),
-    ]
+        logging.FileHandler(
+            "/home/ec2-user/google-docs-live/logs/llm_processor_worker.log"
+        ),
+    ],
 )
 log = logging.getLogger("llm_processor_worker")
 
-# ── AWS ── (large connection pool for 30 workers)
-boto_config = Config(max_pool_connections=150)
-s3              = boto3.client("s3", region_name=AWS_REGION, config=boto_config)
-bedrock_runtime = boto3.client("bedrock-runtime", region_name=AWS_REGION, config=boto_config)
+# ── AWS CLIENTS ───────────────────────────────────────────────────────────────
+_boto_cfg = Config(
+    max_pool_connections=150,
+    read_timeout=1200,
+    connect_timeout=30,
+)
+s3c      = boto3.client("s3",             region_name=AWS_REGION, config=_boto_cfg)
+sm       = boto3.client("secretsmanager", region_name=AWS_REGION)
+bedrock  = boto3.client("bedrock-runtime", region_name=AWS_REGION, config=_boto_cfg)
 
-# ── PROMPT ──
-def load_prompt() -> str:
+# ── SECRETS ───────────────────────────────────────────────────────────────────
+_sec_cache = {}
+_sec_lock  = threading.Lock()
+
+def get_secret(name):
+    with _sec_lock:
+        if name not in _sec_cache:
+            raw = sm.get_secret_value(SecretId=name)["SecretString"]
+            _sec_cache[name] = json.loads(raw)
+        return _sec_cache[name]
+
+# ── PROMPT ────────────────────────────────────────────────────────────────────
+_prompt = None
+_prompt_lock = threading.Lock()
+
+def get_prompt():
+    global _prompt
+    with _prompt_lock:
+        if _prompt is None:
+            with open(PROMPT_FILE, "r", encoding="utf-8") as f:
+                _prompt = f.read()
+        return _prompt
+
+# ── S3 HELPERS ────────────────────────────────────────────────────────────────
+
+def s3_read(key):
     try:
-        with open(PROMPT_FILE, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    except Exception as e:
-        log.error(f"Failed to load prompt.txt: {e}")
-        return ""
-
-# ── VTT PARSER ──
-def parse_vtt(vtt_content: str) -> str:
-    lines    = vtt_content.split("\n")
-    segments = []
-    current  = {"speaker": "", "text": ""}
-    for line in lines:
-        line = line.strip()
-        if not line or line == "WEBVTT" or line.isdigit() or "-->" in line:
-            continue
-        if ": " in line:
-            speaker, text = line.split(": ", 1)
-            speaker = speaker.strip()
-            text    = text.strip()
-            if speaker == current["speaker"]:
-                current["text"] += " " + text
-            else:
-                if current["speaker"]:
-                    segments.append(f"{current['speaker']}: {current['text']}")
-                current = {"speaker": speaker, "text": text}
-        else:
-            if current["speaker"] and line:
-                current["text"] += " " + line
-    if current["speaker"]:
-        segments.append(f"{current['speaker']}: {current['text']}")
-    return "\n".join(segments)
-
-# ── S3 HELPERS ──
-def read_s3_text(key: str) -> str:
-    try:
-        obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
-        return obj["Body"].read().decode("utf-8")
+        return s3c.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read().decode("utf-8")
     except Exception:
         return ""
 
-def write_s3_text(key: str, content: str):
-    s3.put_object(
+def s3_put_json(key, data):
+    s3c.put_object(
         Bucket=S3_BUCKET, Key=key,
-        Body=content.encode("utf-8"), ContentType="text/plain"
+        Body=json.dumps(data, indent=2).encode(),
+        ContentType="application/json",
     )
 
-def write_s3_json(key: str, data: dict):
-    s3.put_object(
-        Bucket=S3_BUCKET, Key=key,
-        Body=json.dumps(data, indent=2).encode("utf-8"),
-        ContentType="application/json"
+def s3_exists(key):
+    try:
+        s3c.head_object(Bucket=S3_BUCKET, Key=key)
+        return True
+    except Exception:
+        return False
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRANSCRIPT WAIT LOGIC
+# ══════════════════════════════════════════════════════════════════════════════
+
+def has_transcript(base_prefix):
+    """Check if TRANSCRIPT/*.vtt exists under final S3 path."""
+    prefix = f"{base_prefix}/TRANSCRIPT/"
+    try:
+        resp = s3c.list_objects_v2(
+            Bucket=S3_BUCKET, Prefix=prefix, MaxKeys=10
+        )
+        for obj in resp.get("Contents", []):
+            if obj["Key"].endswith(".vtt"):
+                log.info(f"Transcript found: {obj['Key']}")
+                return True
+        return False
+    except Exception as e:
+        log.warning(f"Transcript check error [{base_prefix}]: {e}")
+        return False
+
+
+def read_retry_state(temp_prefix):
+    """Read llm-retry.json. Returns {} if not exists."""
+    raw = s3_read(f"{temp_prefix}/llm-retry.json")
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+def write_retry_state(temp_prefix, meeting_id, state):
+    """Write llm-retry.json to S3 temp."""
+    now_utc = datetime.now(timezone.utc)
+    state.update({
+        "meeting_id":     meeting_id,
+        "updated_at":     now_utc.isoformat(),
+        "updated_at_ist": (now_utc + IST_OFFSET).strftime("%Y-%m-%d %I:%M:%S %p IST"),
+        "max_retries":    MAX_TRANSCRIPT_RETRIES,
+        "retry_interval_minutes": RETRY_WAIT_MINUTES,
+    })
+    s3_put_json(f"{temp_prefix}/llm-retry.json", state)
+
+
+def write_llm_error(temp_prefix, meeting_id, base_prefix, retries):
+    """Write llm-error.json — permanent failure, scanner skips this forever."""
+    now_utc = datetime.now(timezone.utc)
+    s3_put_json(f"{temp_prefix}/llm-error.json", {
+        "meeting_id":        meeting_id,
+        "status":            "transcript_not_found",
+        "reason":            (
+            f"TRANSCRIPT/*.vtt never appeared after {retries} retries "
+            f"({retries * RETRY_WAIT_MINUTES} minutes total wait)"
+        ),
+        "retries_attempted": retries,
+        "waited_minutes":    retries * RETRY_WAIT_MINUTES,
+        "base_prefix":       base_prefix,
+        "error_at":          now_utc.isoformat(),
+        "error_at_ist":      (now_utc + IST_OFFSET).strftime("%Y-%m-%d %I:%M:%S %p IST"),
+        "action":            "LLM skipped permanently — no transcript available",
+    })
+    log.warning(
+        f"[{meeting_id}] ❌ llm-error.json written — "
+        f"transcript never arrived after {retries} retries "
+        f"({retries * RETRY_WAIT_MINUTES} min)"
     )
 
-# ── FIND REAL FOLDER FOR MEETING ──
-def find_meeting_folder(meeting_id: str) -> dict | None:
-    paginator  = s3.get_paginator("list_objects_v2")
-    search_str = f"/{meeting_id}/"
-    prefix_files = {}
 
-    for dept in DEPARTMENTS:
-        try:
-            for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=f"{dept}/"):
-                for obj in page.get("Contents", []):
-                    key = obj["Key"]
-                    if search_str not in key:
-                        continue
-                    parts = key.split("/")
-                    try:
-                        mid_idx = parts.index(meeting_id)
-                    except ValueError:
-                        continue
-                    if dept == "Interview-Success":
-                        end = mid_idx + 5
-                    else:
-                        end = mid_idx + 3
-                    if len(parts) > end:
-                        base = "/".join(parts[:end])
-                    else:
-                        base = "/".join(parts[:mid_idx + 1])
-                    if base not in prefix_files:
-                        prefix_files[base] = []
-                    prefix_files[base].append(key)
-        except Exception as e:
-            log.warning(f"Search error in {dept}: {e}")
+def should_retry_now(state):
+    """True if >= RETRY_WAIT_MINUTES have passed since last check."""
+    last = state.get("last_checked_at")
+    if not last:
+        return True
+    try:
+        last_dt = datetime.fromisoformat(last)
+        elapsed = (datetime.now(timezone.utc) - last_dt).total_seconds() / 60
+        return elapsed >= RETRY_WAIT_MINUTES
+    except Exception:
+        return True
 
-    if not prefix_files:
-        return None
 
-    best_prefix    = None
-    transcript_key = None
+def transcript_wait_check(meeting_id, temp_prefix, base_prefix):
+    """
+    Check transcript availability with retry logic.
 
-    for prefix, keys in prefix_files.items():
-        for key in keys:
-            if "/TRANSCRIPT/" in key and key.endswith(".vtt"):
-                best_prefix    = prefix
-                transcript_key = key
-                break
-        if best_prefix:
-            break
+    Returns:
+      "go"   — transcript found, proceed with LLM
+      "wait" — no transcript yet, will retry later
+      "stop" — retries exhausted, llm-error.json written
 
-    if not best_prefix:
-        for prefix, keys in prefix_files.items():
-            for key in keys:
-                if key.endswith("/docs/doc.txt"):
-                    best_prefix = prefix
-                    break
-            if best_prefix:
-                break
+    Retry flow:
+      - Each call that finds no transcript increments retry counter
+      - Only retries if >= RETRY_WAIT_MINUTES since last check
+      - After MAX_TRANSCRIPT_RETRIES → permanent error
+    """
+    # ── Transcript found → proceed ────────────────────────────────────────
+    if has_transcript(base_prefix):
+        log.info(f"[{meeting_id}] ✅ Transcript found — proceeding with LLM")
+        return "go"
 
-    if not best_prefix:
-        best_prefix = sorted(prefix_files.keys())[0]
+    # ── No transcript — check retry state ────────────────────────────────
+    state   = read_retry_state(temp_prefix)
+    retries = state.get("retries", 0)
+    now_utc = datetime.now(timezone.utc)
 
-    log.info(f"Found folder for meeting_id={meeting_id}: {best_prefix}")
+    # Too soon to retry (< 10 min since last check)
+    if not should_retry_now(state):
+        last_ist = state.get("updated_at_ist", "?")
+        log.info(
+            f"[{meeting_id}] ⏳ No transcript — too soon to retry "
+            f"(retry {retries}/{MAX_TRANSCRIPT_RETRIES}, last check: {last_ist})"
+        )
+        return "wait"
 
-    return {
-        "base_prefix":    best_prefix,
-        "transcript_key": transcript_key,
-        "doc_key":        f"{best_prefix}/docs/doc.txt",
-        "llm_key":        f"{best_prefix}/llm/llm.txt",
-    }
+    # Enough time passed — count this as a retry attempt
+    retries += 1
 
-# ── FIND UNPROCESSED MEETINGS ──
-def find_unprocessed_meetings() -> list[dict]:
-    paginator   = s3.get_paginator("list_objects_v2")
-    has_done    = {}
-    has_llmdone = set()
+    # Retries exhausted → permanent failure
+    if retries >= MAX_TRANSCRIPT_RETRIES:
+        write_llm_error(temp_prefix, meeting_id, base_prefix, retries)
+        return "stop"
 
-    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix="temp/live-doc-history/"):
+    # Save updated retry state and skip this cycle
+    write_retry_state(temp_prefix, meeting_id, {
+        "retries":          retries,
+        "first_checked_at": state.get("first_checked_at", now_utc.isoformat()),
+        "last_checked_at":  now_utc.isoformat(),
+        "base_prefix":      base_prefix,
+    })
+    log.info(
+        f"[{meeting_id}] ⏳ No transcript yet — "
+        f"retry {retries}/{MAX_TRANSCRIPT_RETRIES} "
+        f"(next check in ~{RETRY_WAIT_MINUTES} min)"
+    )
+    return "wait"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# S3 SCANNER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def scan_s3_for_unprocessed():
+    """
+    Find meetings with done.json but no llm-done.json and no llm-error.json.
+    Handles NEW and OLD temp path structures.
+    """
+    paginator      = s3c.get_paginator("list_objects_v2")
+    has_done       = {}   # meeting_id → {pfx, lm}
+    has_llm_done   = set()
+    has_llm_error  = set()  # NEW: permanent failures — skip forever
+
+    for page in paginator.paginate(Bucket=S3_BUCKET,
+                                   Prefix="temp/live-doc-history/"):
         for obj in page.get("Contents", []):
-            key           = obj["Key"]
-            last_modified = obj.get("LastModified")
-            parts         = key.split("/")
+            key   = obj["Key"]
+            lm    = obj.get("LastModified")
+            parts = key.split("/")
 
-            if len(parts) == 7 and parts[2].isdigit() and parts[3].startswith("Month-"):
-                meeting_id = parts[5]
-                filename   = parts[6]
-                prefix     = "/".join(parts[:6])
+            # NEW: temp/live-doc-history/YYYY/Month-M/YYYY-MM-DD/mid/file
+            if (len(parts) >= 7
+                    and parts[2].isdigit() and len(parts[2]) == 4
+                    and parts[3].startswith("Month-")):
+                mid = parts[5]
+                fn  = parts[6]
+                pfx = "/".join(parts[:6])
+
+            # OLD: temp/live-doc-history/mid/file
             elif len(parts) == 4 and parts[2].isdigit():
-                meeting_id = parts[2]
-                filename   = parts[3]
-                prefix     = "/".join(parts[:3])
+                mid = parts[2]
+                fn  = parts[3]
+                pfx = "/".join(parts[:3])
+
             else:
                 continue
 
-            if filename == "done.json":
-                has_done[meeting_id] = {
-                    "key":           key,
-                    "prefix":        prefix,
-                    "last_modified": last_modified,
-                }
-            elif filename == "llm-done.json":
-                has_llmdone.add(meeting_id)
+            if not mid.isdigit():
+                continue
 
-    unprocessed = []
-    for meeting_id, info in has_done.items():
-        if meeting_id not in has_llmdone:
-            unprocessed.append({
-                "meeting_id":    meeting_id,
-                "temp_prefix":   info["prefix"],
-                "done_key":      info["key"],
-                "last_modified": info["last_modified"],
-            })
+            if fn == "done.json":
+                has_done[mid] = {"pfx": pfx, "lm": lm}
+            elif fn == "llm-done.json":
+                has_llm_done.add(mid)
+            elif fn == "llm-error.json":
+                has_llm_error.add(mid)  # ← NEW: permanent failure
 
-    # Sort NEWEST first
-    unprocessed.sort(
-        key=lambda x: x["last_modified"] or datetime.min.replace(tzinfo=timezone.utc),
-        reverse=True
+    # Meetings ready to process
+    pending = [
+        {"mid": mid, "pfx": info["pfx"], "lm": info["lm"]}
+        for mid, info in has_done.items()
+        if mid not in has_llm_done    # not already processed
+        and mid not in has_llm_error  # not permanently failed  ← NEW
+    ]
+
+    # Newest first
+    pending.sort(
+        key=lambda x: x["lm"] or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
     )
 
-    if unprocessed:
-        newest = unprocessed[0]
-        oldest = unprocessed[-1]
-        log.info(
-            f"Found {len(has_done)} finalized, "
-            f"{len(has_llmdone)} LLM processed, "
-            f"{len(unprocessed)} need processing "
-            f"(newest: {newest['meeting_id']}, oldest: {oldest['meeting_id']})"
-        )
-    else:
-        log.info(f"Found {len(has_done)} finalized, {len(has_llmdone)} LLM processed, 0 need processing")
+    log.info(
+        f"Scanner: {len(pending)} to process | "
+        f"{len(has_done)} have done.json | "
+        f"{len(has_llm_done)} already processed | "
+        f"{len(has_llm_error)} permanently failed (no transcript)"
+    )
+    return pending
 
-    return unprocessed
+# ══════════════════════════════════════════════════════════════════════════════
+# VTT PARSER
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ── CALL BEDROCK CLAUDE HAIKU 4.5 ──
-def call_bedrock(prompt: str, doc_txt: str, transcript: str) -> str:
-    # Truncate to fit within context window
-    doc_trunc        = doc_txt[:30000]
-    transcript_trunc = transcript[:30000]
+def parse_vtt(vtt_text):
+    """Convert VTT transcript to plain text."""
+    lines = []
+    for line in vtt_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("WEBVTT") or "-->" in line:
+            continue
+        if line.isdigit():
+            continue
+        lines.append(line)
+    return " ".join(lines)
 
-    # Build JSON input as prompt expects
-    user_input = json.dumps({
-        "transcript_webvtt": transcript_trunc,
-        "document_version_history": doc_trunc,
-        "analysis_context": {
-            "candidate_name_hint": None,
-            "company_name_hint": None,
-            "role_title_hint": None,
-            "round_type_hint": None,
-            "timezone_hint": "IST",
-            "meeting_start_absolute_hint": None,
-            "is_mock_interview": True
-        },
-        "support_reference_materials": []
-    }, ensure_ascii=False)
 
-    user_message = prompt + "\n\nINPUT:\n" + user_input
+def get_transcript_text(base_prefix):
+    """
+    Find and read TRANSCRIPT/*.vtt from S3.
+    Returns plain text or empty string.
+    """
+    prefix = f"{base_prefix}/TRANSCRIPT/"
+    try:
+        resp = s3c.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix, MaxKeys=10)
+        for obj in resp.get("Contents", []):
+            if obj["Key"].endswith(".vtt"):
+                vtt = s3_read(obj["Key"])
+                if vtt:
+                    return parse_vtt(vtt)
+    except Exception as e:
+        log.warning(f"VTT read error [{base_prefix}]: {e}")
+    return ""
 
+# ══════════════════════════════════════════════════════════════════════════════
+# LLM CALL (Bedrock Streaming)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def call_bedrock_streaming(prompt_text, system_prompt):
+    """
+    Call Claude Haiku 4.5 via Bedrock with streaming + prompt caching.
+    Returns full response text.
+    """
     body = json.dumps({
         "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 4096,
-        "messages": [
+        "max_tokens": MAX_OUTPUT_TOKENS,
+        "system": [
             {
-                "role": "user",
-                "content": user_message
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"},
             }
-        ]
+        ],
+        "messages": [
+            {"role": "user", "content": prompt_text}
+        ],
     })
 
-    response = bedrock_runtime.invoke_model(
+    response = bedrock.invoke_model_with_response_stream(
         modelId=BEDROCK_MODEL_ID,
-        body=body,
         contentType="application/json",
-        accept="application/json"
+        accept="application/json",
+        body=body,
     )
 
-    response_body = json.loads(response["body"].read())
-    return response_body["content"][0]["text"].strip()
+    full_text = []
+    stream = response.get("body")
+    if stream:
+        for event in stream:
+            chunk = event.get("chunk")
+            if chunk:
+                chunk_data = json.loads(chunk.get("bytes", b"{}"))
+                if chunk_data.get("type") == "content_block_delta":
+                    delta = chunk_data.get("delta", {})
+                    if delta.get("type") == "text_delta":
+                        full_text.append(delta.get("text", ""))
 
-# ── PROCESS ONE MEETING ──
-def process_one_meeting(item: dict) -> str:
-    meeting_id  = item["meeting_id"]
-    temp_prefix = item["temp_prefix"]
+    return "".join(full_text)
 
-    log.info(f"Processing meeting_id={meeting_id}")
 
-    # Find real S3 folder
-    folder = find_meeting_folder(meeting_id)
-    if not folder:
-        return f"SKIP  {meeting_id} — no S3 folder found"
+def run_llm_3part(doc_text, transcript_text, meeting_id):
+    """
+    3-part split with smart skip.
+    Part 1: META + SUMMARY + ROLES + FLOW + DYNAMICS + Q&A
+    Part 2: CANDIDATE + SUPPORT + INTERVIEWER + HIRING (if missing)
+    Part 3: IMPROVEMENT + MISTAKES + VERDICT + GAPS (if missing)
+    Smart skip: if Part 1 has 7+ final sections → skip Parts 2 & 3
+    """
+    prompt      = get_prompt()
+    input_text  = f"DOCUMENT:\n{doc_text}\n\nTRANSCRIPT:\n{transcript_text or 'N/A'}"
 
-    base_prefix    = folder["base_prefix"]
-    transcript_key = folder["transcript_key"]
-    doc_key        = folder["doc_key"]
-    llm_key        = folder["llm_key"]
-
-    # Read transcript
-    transcript = "(No transcript available)"
-    if transcript_key:
-        vtt_raw = read_s3_text(transcript_key)
-        if vtt_raw:
-            transcript = parse_vtt(vtt_raw)
-            log.info(f"Transcript loaded: {len(transcript)} chars")
-
-    # Read doc.txt
-    doc_txt = read_s3_text(doc_key)
-    if not doc_txt:
-        doc_txt = read_s3_text(f"{temp_prefix}/doc.txt")
-    if not doc_txt:
-        doc_txt = "(No interview notes available)"
-
-    # Skip if nothing to analyze
-    if doc_txt == "(No interview notes available)" and transcript == "(No transcript available)":
-        return f"SKIP  {meeting_id} — no doc.txt and no transcript"
-
-    # Load prompt
-    prompt = load_prompt()
-    if not prompt:
-        return f"ERROR {meeting_id} — prompt.txt empty"
-
-    # Call Bedrock with retry
-    log.info(f"Calling Bedrock Claude Haiku 4.5 for meeting_id={meeting_id}...")
-    llm_output = None
-    for attempt in range(3):
-        try:
-            llm_output = call_bedrock(prompt, doc_txt, transcript)
-            if llm_output:
-                break
-            log.warning(f"Empty output attempt {attempt+1} for {meeting_id}")
-        except Exception as e:
-            log.warning(f"Bedrock attempt {attempt+1} failed for {meeting_id}: {e}")
-            if attempt < 2:
-                time.sleep(5)
-            else:
-                return f"ERROR {meeting_id} — Bedrock failed after 3 attempts: {e}"
-
-    if not llm_output:
-        return f"ERROR {meeting_id} — Bedrock returned empty output"
-
-    # Save llm.txt
     now_utc = datetime.now(timezone.utc)
-    now_ist = (now_utc + IST_OFFSET).strftime("%Y-%m-%d %I:%M:%S %p IST")
+    header  = (
+        f"LLM ANALYSIS REPORT\n"
+        f"Meeting ID: {meeting_id}\n"
+        f"Generated At: {now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC "
+        f"({(now_utc + IST_OFFSET).strftime('%Y-%m-%d %I:%M:%S %p')} IST)\n"
+        f"Model: Claude Haiku 4.5 (AWS Bedrock)\n"
+        f"\n{'='*60}\n"
+    )
 
-    llm_content = f"""LLM ANALYSIS REPORT
-Meeting ID: {meeting_id}
-Generated At: {now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')} ({now_ist})
-Model: Claude Haiku 4.5 (AWS Bedrock)
-Base Folder: s3://{S3_BUCKET}/{base_prefix}
-Doc Source: s3://{S3_BUCKET}/{doc_key}
-Transcript: s3://{S3_BUCKET}/{transcript_key or 'N/A'}
+    # Part 1
+    log.info(f"[{meeting_id}] LLM Part 1 starting...")
+    part1_prompt = (
+        f"{prompt}\n\n"
+        f"OUTPUT PART 1: Generate sections: "
+        f"audit_metadata, audit_summary_card, role_identification, "
+        f"flat_summary, overall_dynamics_of_interview, question_answer_support_mapping\n\n"
+        f"{input_text}"
+    )
+    part1 = call_bedrock_streaming(part1_prompt, prompt)
+    log.info(f"[{meeting_id}] LLM Part 1 done ({len(part1)} chars)")
 
-{'='*60}
-{llm_output}
-"""
-    write_s3_text(llm_key, llm_content)
-    log.info(f"llm.txt saved: s3://{S3_BUCKET}/{llm_key}")
+    # Smart skip: count final sections in part1
+    final_sections = [
+        "overall_candidate_performance", "overall_proxy_support_performance",
+        "overall_interviewer_performance", "chance_of_moving_forward",
+        "if_chances_are_less_next_time_plan", "mistake_and_risk_ledger",
+        "final_verdict", "insufficient_context",
+    ]
+    found = sum(1 for s in final_sections if s in part1)
+    if found >= 7:
+        log.info(f"[{meeting_id}] Smart skip: {found}/8 final sections in Part 1 ✅")
+        return header + part1
 
-    # Create llm-done.json in temp
-    llm_done = {
-        "meeting_id":       meeting_id,
-        "status":           "llm_processed",
-        "processed_at":     now_utc.isoformat(),
-        "processed_at_ist": now_ist,
-        "model":            "claude-haiku-4-5 (AWS Bedrock)",
-        "llm_txt":          f"s3://{S3_BUCKET}/{llm_key}",
-        "doc_source":       f"s3://{S3_BUCKET}/{doc_key}",
-        "transcript":       f"s3://{S3_BUCKET}/{transcript_key}" if transcript_key else "N/A",
-        "base_prefix":      base_prefix,
-        "temp_prefix":      temp_prefix,
-    }
-    write_s3_json(f"{temp_prefix}/llm-done.json", llm_done)
-    log.info(f"llm-done.json created for meeting_id={meeting_id}")
+    # Part 2
+    log.info(f"[{meeting_id}] LLM Part 2 starting...")
+    part2_prompt = (
+        f"{prompt}\n\n"
+        f"CONTINUATION — Part 2. Previous output:\n{part1[:3000]}...\n\n"
+        f"OUTPUT PART 2: Generate ONLY missing sections: "
+        f"overall_candidate_performance, overall_proxy_support_performance, "
+        f"overall_interviewer_performance, chance_of_moving_forward\n"
+        f"Start immediately with the first missing section. "
+        f"DO NOT regenerate sections already in Part 1.\n\n"
+        f"{input_text}"
+    )
+    part2 = call_bedrock_streaming(part2_prompt, prompt)
+    log.info(f"[{meeting_id}] LLM Part 2 done ({len(part2)} chars)")
 
-    return f"OK    {meeting_id} → s3://{S3_BUCKET}/{llm_key}"
+    combined = part1 + "\n" + part2
+    found2 = sum(1 for s in final_sections if s in combined)
+    if found2 >= 7:
+        log.info(f"[{meeting_id}] Smart skip after Part 2: {found2}/8 sections ✅")
+        return header + combined
 
-# ── MAIN ──
-def main():
-    log.info(f"llm_processor_worker starting — model=Claude Haiku 4.5 (Bedrock) — max_workers={MAX_WORKERS}")
+    # Part 3
+    log.info(f"[{meeting_id}] LLM Part 3 starting...")
+    part3_prompt = (
+        f"{prompt}\n\n"
+        f"CONTINUATION — Part 3 (final). Previous output summary:\n"
+        f"{combined[-2000:]}...\n\n"
+        f"OUTPUT PART 3: Generate ONLY missing sections: "
+        f"if_chances_are_less_next_time_plan, mistake_and_risk_ledger, "
+        f"final_verdict, insufficient_context\n"
+        f"Start immediately with the first missing section. "
+        f"DO NOT regenerate any sections already written. "
+        f"STOP IMMEDIATELY after insufficient_context.\n\n"
+        f"{input_text}"
+    )
+    part3 = call_bedrock_streaming(part3_prompt, prompt)
+    log.info(f"[{meeting_id}] LLM Part 3 done ({len(part3)} chars)")
 
-    prompt = load_prompt()
-    if not prompt:
-        log.error(f"prompt.txt not found at {PROMPT_FILE}")
-        sys.exit(1)
-    log.info(f"Prompt loaded: {len(prompt)} chars")
+    return header + combined + "\n" + part3
 
-    # Test Bedrock connection
+# ══════════════════════════════════════════════════════════════════════════════
+# CORE: PROCESS ONE MEETING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def process_one_meeting(item):
+    mid = item["mid"]
+    pfx = item["pfx"]
+    log.info(f"[{mid}] ── Processing ──")
+
+    # ── 1. Read done.json → get base_prefix ──────────────────────────────
+    done_raw = s3_read(f"{pfx}/done.json")
+    if not done_raw:
+        return f"SKIP {mid} — done.json missing"
     try:
-        bedrock_runtime.invoke_model(
-            modelId=BEDROCK_MODEL_ID,
-            body=json.dumps({
-                "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": 10,
-                "messages": [{"role": "user", "content": "hi"}]
-            }),
-            contentType="application/json",
-            accept="application/json"
-        )
-        log.info("Bedrock Claude Haiku 4.5 connection verified ✅")
-    except Exception as e:
-        log.error(f"Bedrock connection failed: {e}")
-        sys.exit(1)
+        done = json.loads(done_raw)
+    except Exception:
+        return f"SKIP {mid} — done.json parse error"
 
+    base_prefix = done.get("base_prefix", "").replace(
+        f"s3://{S3_BUCKET}/", "").rstrip("/")
+    if not base_prefix:
+        return f"SKIP {mid} — base_prefix empty in done.json"
+
+    log.info(f"[{mid}] base_prefix='{base_prefix}'")
+
+    # ── 2. Transcript wait check (NEW) ───────────────────────────────────
+    transcript_status = transcript_wait_check(mid, pfx, base_prefix)
+
+    if transcript_status == "wait":
+        return f"WAIT {mid} — transcript not ready, retry in ~{RETRY_WAIT_MINUTES}min"
+
+    if transcript_status == "stop":
+        return f"ERROR {mid} — transcript never arrived after {MAX_TRANSCRIPT_RETRIES} retries"
+
+    # transcript_status == "go" → proceed with LLM
+
+    # ── 3. Read doc.txt ───────────────────────────────────────────────────
+    doc_txt = s3_read(f"{base_prefix}/docs/doc.txt")
+    if not doc_txt:
+        return f"SKIP {mid} — doc.txt not found"
+
+    # ── 4. Read transcript ────────────────────────────────────────────────
+    transcript_text = get_transcript_text(base_prefix)
+    log.info(f"[{mid}] Transcript length: {len(transcript_text)} chars")
+
+    # ── 5. Run LLM ────────────────────────────────────────────────────────
+    log.info(f"[{mid}] Starting LLM analysis...")
+    try:
+        llm_output = run_llm_3part(doc_txt, transcript_text, mid)
+    except Exception as e:
+        log.error(f"[{mid}] LLM call failed: {e}", exc_info=True)
+        return f"ERROR {mid} — LLM call failed: {e}"
+
+    log.info(f"[{mid}] LLM output: {len(llm_output)} chars")
+
+    # ── 6. Save llm.txt to final S3 path ─────────────────────────────────
+    llm_key = f"{base_prefix}/llm/llm.txt"
+    s3c.put_object(
+        Bucket=S3_BUCKET, Key=llm_key,
+        Body=llm_output.encode("utf-8"),
+        ContentType="text/plain",
+    )
+    log.info(f"[{mid}] ✅ llm.txt saved: {llm_key}")
+
+    # ── 7. Write llm-done.json to temp ───────────────────────────────────
+    now_utc = datetime.now(timezone.utc)
+    s3_put_json(f"{pfx}/llm-done.json", {
+        "meeting_id":      mid,
+        "status":          "llm_processed",
+        "processed_at":    now_utc.isoformat(),
+        "processed_at_ist": (now_utc + IST_OFFSET).strftime("%Y-%m-%d %I:%M:%S %p IST"),
+        "model":           "claude-haiku-4-5 (AWS Bedrock)",
+        "llm_txt":         f"s3://{S3_BUCKET}/{llm_key}",
+        "doc_source":      f"s3://{S3_BUCKET}/{base_prefix}/docs/doc.txt",
+        "transcript":      "found" if transcript_text else "N/A",
+        "base_prefix":     base_prefix,
+        "temp_prefix":     pfx,
+        "output_chars":    len(llm_output),
+    })
+    log.info(f"[{mid}] ✅ llm-done.json written")
+
+    # ── 8. Cost estimate log ──────────────────────────────────────────────
+    input_tokens  = (len(doc_txt) + len(transcript_text)) // 4
+    output_tokens = len(llm_output) // 4
+    est_cost      = (input_tokens / 1_000_000 * 0.80) + (output_tokens / 1_000_000 * 4.00)
+    log.info(
+        f"[{mid}] 💰 ~{input_tokens:,} input tokens, "
+        f"~{output_tokens:,} output tokens, "
+        f"est cost ~${est_cost:.4f}"
+    )
+
+    return f"OK {mid} | {len(llm_output)} chars | ${est_cost:.4f}"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BACKFILL LOOP
+# ══════════════════════════════════════════════════════════════════════════════
+
+def backfill_loop():
+    log.info("Backfill loop started")
     while True:
         try:
-            items = find_unprocessed_meetings()
+            pending = scan_s3_for_unprocessed()
 
-            if not items:
-                log.info(f"No unprocessed meetings. Waiting {POLL_INTERVAL}s...")
-                time.sleep(POLL_INTERVAL)
+            if not pending:
+                log.info(f"Backfill: nothing to process. Sleeping {SCAN_INTERVAL}s")
+                time.sleep(SCAN_INTERVAL)
                 continue
 
-            log.info(f"Processing {len(items)} meetings with {MAX_WORKERS} workers...")
-
+            log.info(f"Backfill: processing {len(pending)} meetings with {BACKFILL_WORKERS} workers")
             with ThreadPoolExecutor(
-                max_workers=MAX_WORKERS,
+                max_workers=BACKFILL_WORKERS,
                 thread_name_prefix="llm-worker"
-            ) as executor:
+            ) as ex:
                 futures = {
-                    executor.submit(process_one_meeting, item): item["meeting_id"]
-                    for item in items
+                    ex.submit(process_one_meeting, item): item["mid"]
+                    for item in pending
                 }
                 for future in as_completed(futures):
                     mid = futures[future]
                     try:
                         result = future.result()
-                        log.info(result)
+                        if result.startswith("OK"):
+                            log.info(f"✅ {result}")
+                        elif result.startswith("WAIT"):
+                            log.info(f"⏳ {result}")
+                        elif result.startswith("ERROR"):
+                            log.warning(f"❌ {result}")
+                        else:
+                            log.info(f"⏭️  {result}")
                     except Exception as e:
-                        log.error(f"[{mid}] Error: {e}", exc_info=True)
+                        log.error(f"Worker error [{mid}]: {e}", exc_info=True)
 
-            log.info(f"Batch complete. Waiting {POLL_INTERVAL}s...")
-            time.sleep(POLL_INTERVAL)
+            log.info(f"Backfill batch done. Sleeping {SCAN_INTERVAL}s")
+            time.sleep(SCAN_INTERVAL)
 
         except Exception as e:
-            log.error(f"Main loop error: {e}", exc_info=True)
+            log.error(f"Backfill loop error: {e}", exc_info=True)
             time.sleep(30)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    log.info("=" * 60)
+    log.info("llm_processor_worker starting")
+    log.info(f"  Model:          {BEDROCK_MODEL_ID}")
+    log.info(f"  Workers:        {BACKFILL_WORKERS}")
+    log.info(f"  Max retries:    {MAX_TRANSCRIPT_RETRIES} (transcript wait)")
+    log.info(f"  Retry interval: {RETRY_WAIT_MINUTES} min")
+    log.info(f"  Total wait max: {MAX_TRANSCRIPT_RETRIES * RETRY_WAIT_MINUTES} min")
+    log.info("=" * 60)
+
+    # Verify prompt file
+    try:
+        p = get_prompt()
+        log.info(f"Prompt loaded: {len(p)} chars ✅")
+    except Exception as e:
+        log.error(f"Prompt file error: {e}")
+        sys.exit(1)
+
+    # Verify Bedrock access
+    try:
+        bedrock.list_foundation_models(byProvider="anthropic")
+        log.info("Bedrock access ✅")
+    except Exception as e:
+        log.warning(f"Bedrock list check failed (may still work): {e}")
+
+    backfill_loop()
+
 
 if __name__ == "__main__":
     main()
