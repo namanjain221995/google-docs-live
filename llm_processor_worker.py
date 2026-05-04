@@ -1,7 +1,12 @@
 """
 llm_processor_worker.py
 =======================
-LLM Analysis Worker — AWS Bedrock Claude Haiku 4.5
+LLM Analysis Worker — AWS Bedrock Claude Haiku 4.5 + OpenAI GPT-4o-mini fallback
+
+Fallback logic:
+  Primary:  AWS Bedrock (Claude Haiku 4.5) — fast, cheap, cached
+  Fallback: OpenAI GPT-4o-mini — when Bedrock hits daily token quota
+  Both produce the same Flat TOON format output.
 
 Flow:
   1. Scan temp/live-doc-history/ for meetings with done.json but no llm-done.json
@@ -40,7 +45,9 @@ import time
 import logging
 import threading
 import boto3
+import urllib.request
 from botocore.config import Config
+from botocore.exceptions import ClientError
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -51,10 +58,14 @@ PROMPT_FILE       = os.environ.get("PROMPT_FILE",
                     "/home/ec2-user/google-docs-live/prompt.txt")
 
 BEDROCK_MODEL_ID  = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+OPENAI_MODEL_ID   = "gpt-4o-mini"       # fallback when Bedrock throttles
 MAX_OUTPUT_TOKENS = 8192
-BACKFILL_WORKERS  = 50
+BACKFILL_WORKERS  = 30
 SCAN_INTERVAL     = 120        # seconds between backfill scans
 IST_OFFSET        = timedelta(hours=5, minutes=30)
+
+# Throttle detection
+THROTTLE_ERRORS   = ("ThrottlingException", "Too many tokens", "rate limit", "quota")
 
 # Transcript wait config
 MAX_TRANSCRIPT_RETRIES = 6     # max retries waiting for transcript
@@ -436,13 +447,38 @@ def get_transcript_text(base_prefix: str) -> str:
     return ""
 
 # ══════════════════════════════════════════════════════════════════════════════
-# BEDROCK LLM CALL
+# LLM CALLS — BEDROCK PRIMARY + OPENAI FALLBACK
 # ══════════════════════════════════════════════════════════════════════════════
+
+# OpenAI API key cache
+_openai_key      = None
+_openai_key_lock = threading.Lock()
+
+def get_openai_key() -> str:
+    """Get OpenAI API key from AWS Secrets Manager (secrets/api)."""
+    global _openai_key
+    with _openai_key_lock:
+        if _openai_key:
+            return _openai_key
+        sec = get_secret("secrets/api")
+        key = sec.get("OPENAI_API_KEY", "")
+        if not key:
+            raise ValueError("OPENAI_API_KEY not found in secrets/api")
+        _openai_key = key
+        return _openai_key
+
+
+def is_throttle_error(e: Exception) -> bool:
+    """Return True if exception is a Bedrock throttling/quota error."""
+    msg = str(e)
+    return any(t.lower() in msg.lower() for t in THROTTLE_ERRORS)
+
 
 def call_bedrock_streaming(user_message: str, system_prompt: str) -> str:
     """
     Call Claude Haiku 4.5 via Bedrock with streaming + prompt caching.
     Returns full response text.
+    Raises exception on failure (caller handles throttle fallback).
     """
     body = json.dumps({
         "anthropic_version": "bedrock-2023-05-31",
@@ -480,24 +516,123 @@ def call_bedrock_streaming(user_message: str, system_prompt: str) -> str:
     return "".join(chunks)
 
 
-def run_llm_3part(doc_text: str, transcript_text: str,
-                  meeting_id: str) -> str:
+def call_openai(user_message: str, system_prompt: str) -> str:
     """
-    Run LLM with 3-part split and smart skip logic.
+    Call OpenAI GPT-4o-mini as fallback when Bedrock is throttled.
+    Uses urllib (no extra library needed).
+    Returns full response text.
+    """
+    api_key = get_openai_key()
+    payload = json.dumps({
+        "model":      OPENAI_MODEL_ID,
+        "max_tokens": MAX_OUTPUT_TOKENS,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_message},
+        ],
+    }).encode("utf-8")
 
-    Part 1: META + SUMMARY + ROLES + FLOW + DYNAMICS + Q&A
-    Part 2: CANDIDATE + SUPPORT + INTERVIEWER + HIRING  (if Part 1 missing)
-    Part 3: IMPROVEMENT + MISTAKES + VERDICT + GAPS     (if still missing)
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=payload,
+        headers={
+            "Content-Type":  "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=600) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return data["choices"][0]["message"]["content"]
 
-    Smart skip: if Part 1 already has >= 7 of 8 final sections,
-                skip Parts 2 and 3 entirely.
+
+def call_llm(user_message: str, system_prompt: str,
+             meeting_id: str = "", part: str = "") -> tuple:
+    """
+    Call LLM with automatic fallback:
+      1. Try Bedrock (Claude Haiku 4.5)
+      2. On ThrottlingException → fall back to OpenAI (GPT-4o-mini)
+
+    Returns (response_text, provider_used)
+    """
+    # ── Try Bedrock first ─────────────────────────────────────────────────
+    try:
+        result = call_bedrock_streaming(user_message, system_prompt)
+        return result, "bedrock"
+    except Exception as e:
+        if is_throttle_error(e):
+            log.warning(
+                f"[{meeting_id}] Bedrock throttled{' ('+part+')' if part else ''} "
+                f"— falling back to OpenAI GPT-4o-mini"
+            )
+        else:
+            # Non-throttle Bedrock error → re-raise, don't waste OpenAI quota
+            raise
+
+    # ── Fallback to OpenAI ────────────────────────────────────────────────
+    try:
+        result = call_openai(user_message, system_prompt)
+        log.info(
+            f"[{meeting_id}] OpenAI fallback success{' ('+part+')' if part else ''} ✅"
+        )
+        return result, "openai"
+    except Exception as e:
+        log.error(f"[{meeting_id}] OpenAI fallback also failed: {e}")
+        raise
+
+
+def run_llm_openai(doc_text: str, transcript_text: str,
+                   meeting_id: str) -> tuple:
+    """
+    Single-call OpenAI analysis.
+    GPT-4o-mini supports 16K output tokens so the full analysis
+    fits in ONE call — no 3-part split needed.
+    Returns (output_text, "openai")
     """
     prompt     = get_prompt()
     input_text = (
         f"DOCUMENT:\n{doc_text}\n\n"
         f"TRANSCRIPT:\n{transcript_text if transcript_text else 'N/A'}"
     )
+    now_utc = datetime.now(timezone.utc)
+    header  = (
+        f"LLM ANALYSIS REPORT\n"
+        f"Meeting ID: {meeting_id}\n"
+        f"Generated At: {now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC "
+        f"({(now_utc + IST_OFFSET).strftime('%Y-%m-%d %I:%M:%S %p')} IST)\n"
+        f"Model: GPT-4o-mini (OpenAI fallback)\n"
+        f"\n{'=' * 60}\n"
+    )
+    log.info(f"[{meeting_id}] OpenAI single-call starting...")
+    result = call_openai(
+        f"{prompt}\n\n"
+        f"Generate the COMPLETE analysis with ALL sections in one response.\n\n"
+        f"{input_text}",
+        prompt,
+    )
+    log.info(f"[{meeting_id}] OpenAI single-call done ({len(result)} chars)")
+    return header + result, "openai"
 
+
+def run_llm_bedrock(doc_text: str, transcript_text: str,
+                    meeting_id: str) -> tuple:
+    """
+    3-part split for Bedrock Claude Haiku 4.5.
+    Needed because Haiku has 8K output limit per call.
+
+    Part 1: audit_metadata, audit_summary_card, role_identification,
+            flat_summary, overall_dynamics_of_interview, Q&A mapping
+    Part 2: candidate/proxy/interviewer performance + hiring prediction
+    Part 3: improvement plan, mistakes, verdict, gaps
+
+    Smart skip: if Part 1 has >= 7/8 final sections → skip Parts 2+3
+    Returns (output_text, "bedrock")
+    """
+    prompt     = get_prompt()
+    input_text = (
+        f"DOCUMENT:\n{doc_text}\n\n"
+        f"TRANSCRIPT:\n{transcript_text if transcript_text else 'N/A'}"
+    )
     now_utc = datetime.now(timezone.utc)
     header  = (
         f"LLM ANALYSIS REPORT\n"
@@ -507,7 +642,6 @@ def run_llm_3part(doc_text: str, transcript_text: str,
         f"Model: Claude Haiku 4.5 (AWS Bedrock)\n"
         f"\n{'=' * 60}\n"
     )
-
     final_sections = [
         "overall_candidate_performance",
         "overall_proxy_support_performance",
@@ -519,8 +653,8 @@ def run_llm_3part(doc_text: str, transcript_text: str,
         "insufficient_context",
     ]
 
-    # ── Part 1 ────────────────────────────────────────────────────────────────
-    log.info(f"[{meeting_id}] LLM Part 1 starting...")
+    # Part 1
+    log.info(f"[{meeting_id}] Bedrock Part 1 starting...")
     part1 = call_bedrock_streaming(
         f"{prompt}\n\n"
         f"OUTPUT PART 1: Generate these sections only:\n"
@@ -530,54 +664,79 @@ def run_llm_3part(doc_text: str, transcript_text: str,
         f"{input_text}",
         prompt,
     )
-    log.info(f"[{meeting_id}] Part 1 done ({len(part1)} chars)")
+    log.info(f"[{meeting_id}] Bedrock Part 1 done ({len(part1)} chars)")
 
-    # Smart skip check
     found = sum(1 for s in final_sections if s in part1)
     if found >= SMART_SKIP_THRESHOLD:
-        log.info(f"[{meeting_id}] Smart skip: {found}/8 final sections in Part 1 ✅")
-        return header + part1
+        log.info(f"[{meeting_id}] Smart skip: {found}/8 in Part 1 ✅")
+        return header + part1, "bedrock"
 
-    # ── Part 2 ────────────────────────────────────────────────────────────────
-    log.info(f"[{meeting_id}] LLM Part 2 starting...")
+    # Part 2
+    log.info(f"[{meeting_id}] Bedrock Part 2 starting...")
     part2 = call_bedrock_streaming(
         f"{prompt}\n\n"
         f"CONTINUATION — Part 2.\n"
         f"Previous output (last 3000 chars):\n{part1[-3000:]}\n\n"
-        f"OUTPUT PART 2: Generate ONLY these missing sections:\n"
+        f"OUTPUT PART 2: Generate ONLY missing sections:\n"
         f"overall_candidate_performance, overall_proxy_support_performance, "
         f"overall_interviewer_performance, chance_of_moving_forward\n"
-        f"Start immediately with the first missing section. "
         f"DO NOT regenerate any section already in Part 1.\n\n"
         f"{input_text}",
         prompt,
     )
-    log.info(f"[{meeting_id}] Part 2 done ({len(part2)} chars)")
+    log.info(f"[{meeting_id}] Bedrock Part 2 done ({len(part2)} chars)")
 
     combined = part1 + "\n" + part2
     found2   = sum(1 for s in final_sections if s in combined)
     if found2 >= SMART_SKIP_THRESHOLD:
         log.info(f"[{meeting_id}] Smart skip after Part 2: {found2}/8 ✅")
-        return header + combined
+        return header + combined, "bedrock"
 
-    # ── Part 3 ────────────────────────────────────────────────────────────────
-    log.info(f"[{meeting_id}] LLM Part 3 starting...")
+    # Part 3
+    log.info(f"[{meeting_id}] Bedrock Part 3 starting...")
     part3 = call_bedrock_streaming(
         f"{prompt}\n\n"
         f"CONTINUATION — Part 3 (final).\n"
         f"Previous output (last 2000 chars):\n{combined[-2000:]}\n\n"
-        f"OUTPUT PART 3: Generate ONLY these missing sections:\n"
+        f"OUTPUT PART 3: Generate ONLY missing sections:\n"
         f"if_chances_are_less_next_time_plan, mistake_and_risk_ledger, "
         f"final_verdict, insufficient_context\n"
-        f"Start immediately with the first missing section. "
         f"DO NOT regenerate any section already written. "
-        f"STOP IMMEDIATELY after insufficient_context.\n\n"
+        f"STOP after insufficient_context.\n\n"
         f"{input_text}",
         prompt,
     )
-    log.info(f"[{meeting_id}] Part 3 done ({len(part3)} chars)")
+    log.info(f"[{meeting_id}] Bedrock Part 3 done ({len(part3)} chars)")
+    return header + combined + "\n" + part3, "bedrock"
 
-    return header + combined + "\n" + part3
+
+def run_llm_3part(doc_text: str, transcript_text: str,
+                  meeting_id: str) -> tuple:
+    """
+    Master LLM runner:
+      - Try Bedrock first (3-part split, Claude Haiku 4.5)
+      - On ThrottlingException → fall back to OpenAI (single call, GPT-4o-mini)
+
+    Returns (output_text, provider) where provider = "bedrock" or "openai"
+    """
+    # ── Try Bedrock (3-part) ──────────────────────────────────────────────
+    try:
+        return run_llm_bedrock(doc_text, transcript_text, meeting_id)
+    except Exception as e:
+        if is_throttle_error(e):
+            log.warning(
+                f"[{meeting_id}] Bedrock throttled — "
+                f"falling back to OpenAI GPT-4o-mini (single call)"
+            )
+        else:
+            raise
+
+    # ── Fallback: OpenAI single call ─────────────────────────────────────
+    try:
+        return run_llm_openai(doc_text, transcript_text, meeting_id)
+    except Exception as e:
+        log.error(f"[{meeting_id}] OpenAI fallback also failed: {e}")
+        raise
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CORE: PROCESS ONE MEETING
@@ -633,7 +792,7 @@ def process_one_meeting(item: dict) -> str:
     # ── Step 6: Run LLM ───────────────────────────────────────────────────────
     log.info(f"[{mid}] Starting LLM analysis (3-part + smart skip)...")
     try:
-        llm_output = run_llm_3part(doc_txt, transcript_text, mid)
+        llm_output, provider = run_llm_3part(doc_txt, transcript_text, mid)
     except Exception as e:
         log.error(f"[{mid}] LLM call failed: {e}", exc_info=True)
         return f"ERROR {mid} — LLM failed: {e}"
@@ -655,7 +814,7 @@ def process_one_meeting(item: dict) -> str:
         "status":           "llm_processed",
         "processed_at":     now_utc.isoformat(),
         "processed_at_ist": (now_utc + IST_OFFSET).strftime("%Y-%m-%d %I:%M:%S %p IST"),
-        "model":            "claude-haiku-4-5 (AWS Bedrock)",
+        "model":            f"claude-haiku-4-5 (Bedrock)" if provider == "bedrock" else f"gpt-4o-mini (OpenAI)" if provider == "openai" else f"mixed ({provider})",
         "llm_txt":          f"s3://{S3_BUCKET}/{llm_key}",
         "doc_source":       f"s3://{S3_BUCKET}/{base_prefix}/docs/doc.txt",
         "transcript":       "found" if transcript_text else "N/A",
@@ -674,10 +833,10 @@ def process_one_meeting(item: dict) -> str:
     )
     log.info(
         f"[{mid}] 💰 ~{input_tokens:,} in / ~{output_tokens:,} out "
-        f"/ est ~${est_cost:.4f}"
+        f"/ est ~${est_cost:.4f} / provider={provider}"
     )
 
-    return f"OK {mid} | {len(llm_output):,} chars | ${est_cost:.4f}"
+    return f"OK {mid} | {len(llm_output):,} chars | ${est_cost:.4f} | {provider}"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # BACKFILL LOOP
