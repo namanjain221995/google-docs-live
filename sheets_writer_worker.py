@@ -47,11 +47,12 @@ DEPARTMENTS       = ["Interview-Success", "Training", "Customer-Success", "Marke
 LIVE_WORKERS      = 10
 BACKFILL_WORKERS  = 10
 
-# Auto-share new spreadsheets with these emails (editor access)
+# ONLY these 3 people should have access — all others will be removed
 SHARE_WITH_EMAILS = [
     "naman.jain@techsarasolutions.com",
     "rajvi.patel@techsarasolutions.com",
     "sahil.patel@techsarasolutions.com",
+    "techsphere@techsarasolutions.com",
 ]
 LIVE_POLL_INTERVAL   = 30
 BACKFILL_INTERVAL    = 120
@@ -447,11 +448,32 @@ def _parse_flat_toon(body: str) -> dict | None:
         return None
 
     # ── candidate_name ────────────────────────────────────────────────────────
-    candidate_name = (
-        _get_field_flat_toon(body, "candidate_name")
-        or _get_field_flat_toon(body, "candidate_detected")
-        or _get_field_flat_toon(body, "candidate")
-    )
+    # Multi-part LLM outputs have multiple audit_summary_cards.
+    # Part 1 may have "Unknown (Candidate ID: I-025621)" while Part 2/3 has real name.
+    # Strategy: collect ALL candidate_name values, pick best (last non-Unknown/non-ID).
+    def _best_name(text):
+        names = re.findall(
+            r'^\s*candidate_name\s*,\s*"?([^"\n]+)"?\s*$',
+            text, re.MULTILINE | re.IGNORECASE
+        )
+        # Also try candidate_detected
+        detected = re.findall(
+            r'^\s*candidate_detected\s*,\s*"?([^"\n]+)"?\s*$',
+            text, re.MULTILINE | re.IGNORECASE
+        )
+        all_names = names + detected
+        if not all_names:
+            return ""
+        JUNK = ("unknown", "i-0", "candidate id", "not captured", "n/a", "none")
+        # Pick last name that is not junk
+        for n in reversed(all_names):
+            n = n.strip().strip('"').strip()
+            if n and not any(j in n.lower() for j in JUNK):
+                return n
+        # Fall back to first name, cleaned
+        return all_names[0].strip().strip('"').strip()
+
+    candidate_name = _best_name(body) or _best_name(text)
     # Strip SF ID suffix like (I-025513)
     candidate_name = re.sub(r'\s*\([A-Z]-\d+\)', '', candidate_name).strip()
 
@@ -946,20 +968,68 @@ def _setup_tabs(ssvc, sid):
     log.info(f"Tabs set up for {sid}")
 
 # ── Share sheet with configured emails ───────────────────────────────────────
-_shared_sheets = set()
+_shared_sheets = set()   # cache: don't re-check same sheet twice per run
 _shared_lk     = threading.Lock()
 
 def _share_sheet_with_team(dsvc, sid: str):
     """
-    Share spreadsheet with SHARE_WITH_EMAILS as editors.
-    Only shares once per sheet per process run (cached in _shared_sheets).
+    Enforce EXACT access control on spreadsheet:
+      1. Add SHARE_WITH_EMAILS as editors (if not already)
+      2. REMOVE anyone else who has access (except service account owner)
+    Only runs once per sheet per process run (cached).
     """
     with _shared_lk:
         if sid in _shared_sheets:
             return
         _shared_sheets.add(sid)
 
+    allowed = {e.lower() for e in SHARE_WITH_EMAILS}
+
+    # ── Step 1: Get current permissions ──────────────────────────────────────
+    try:
+        perms = dsvc.permissions().list(
+            fileId=sid,
+            fields="permissions(id,emailAddress,role,type)",
+            supportsAllDrives=True,
+        ).execute().get("permissions", [])
+    except Exception as e:
+        log.warning(f"Could not list permissions for {sid}: {e}")
+        perms = []
+
+    # ── Step 2: Remove anyone NOT in allowed list (skip owner/service acct) ──
+    for perm in perms:
+        email = perm.get("emailAddress", "").lower()
+        perm_id = perm.get("id", "")
+        role    = perm.get("role", "")
+        ptype   = perm.get("type", "")
+
+        # Never remove: owner, service account, anyone in allowed list
+        if role == "owner":
+            continue
+        if not email:
+            continue
+        if email in allowed:
+            continue
+        if "gserviceaccount" in email:
+            continue
+
+        # Remove this person
+        try:
+            dsvc.permissions().delete(
+                fileId=sid,
+                permissionId=perm_id,
+                supportsAllDrives=True,
+            ).execute()
+            log.info(f"🗑️  Removed {email} from {sid}")
+        except Exception as e:
+            log.warning(f"Could not remove {email} from {sid}: {e}")
+
+    # ── Step 3: Add allowed emails if not already present ────────────────────
+    existing_emails = {p.get("emailAddress", "").lower() for p in perms}
     for email in SHARE_WITH_EMAILS:
+        if email.lower() in existing_emails:
+            log.debug(f"Already has access: {email}")
+            continue
         try:
             dsvc.permissions().create(
                 fileId=sid,
@@ -974,11 +1044,7 @@ def _share_sheet_with_team(dsvc, sid: str):
             ).execute()
             log.info(f"✅ Shared {sid} with {email}")
         except Exception as e:
-            # Already shared or no permission — not fatal
-            if "already" in str(e).lower() or "403" in str(e):
-                log.debug(f"Already shared {sid} with {email}")
-            else:
-                log.warning(f"Share failed {email}: {e}")
+            log.warning(f"Share failed {email}: {e}")
 
 
 # ── Append row with retry ─────────────────────────────────────────────────────
