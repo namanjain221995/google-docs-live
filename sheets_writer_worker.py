@@ -46,6 +46,13 @@ GDRIVE_FOLDER     = "Interview Success"
 DEPARTMENTS       = ["Interview-Success", "Training", "Customer-Success", "Marketing"]
 LIVE_WORKERS      = 10
 BACKFILL_WORKERS  = 10
+
+# Auto-share new spreadsheets with these emails (editor access)
+SHARE_WITH_EMAILS = [
+    "naman.jain@techsarasolutions.com",
+    "rajvi.patel@techsarasolutions.com",
+    "sahil.patel@techsarasolutions.com",
+]
 LIVE_POLL_INTERVAL   = 30
 BACKFILL_INTERVAL    = 120
 IST               = timedelta(hours=5, minutes=30)
@@ -272,30 +279,29 @@ def _to_bool(s: str) -> bool:
 
 def _extract_categories_flat_toon(text: str, field_name: str) -> str:
     """
-    Extract category names from Flat TOON. Handles ALL known formats:
+    Extract category names. Handles ALL known formats:
 
     FORMAT A — inline brace with real category value:
-      candidate_action_categories[1]{category,"Technical Depth",reason,"..."}
+      field[1]{category,"Technical Depth",reason,"..."}
 
-    FORMAT B — {category,reason} SCHEMA HEADER then CSV lines (new Bedrock format):
-      candidate_action_categories[3]{category,reason},
-        Communication / Delivery,"Severe audio lag...",
-        Problem Solving / Thinking Aloud,"Candidate jumped...",
-        Confidence / Presence,"Candidate frequently..."
+    FORMAT B — {category,reason} SCHEMA HEADER then CSV lines:
+      (with OR without trailing comma after closing brace)
+      field[3]{category,reason},     <- with comma
+      field[3]{category,reason}      <- without comma (also supported)
+        Communication / Delivery,"reason text"
+        Confidence / Presence,"reason text"
 
-    FORMAT C — array header [N], then indented Name,reason lines:
-      candidate_action_categories[2],
-        Technical Depth,needs improvement
-        Communication / Delivery,needs work
+    FORMAT C — [N], array header then indented lines:
+      field[2],
+        Technical Depth,reason text
+        Communication / Delivery,reason text
 
     FORMAT D — category sub-field inside block:
-      candidate_action_categories[1],
+      field[1],
         -
           category,Technical Depth
     """
     cats = []
-
-    # Known schema/field keywords — if captured as "category", it's a header not a value
     SCHEMA_WORDS = {
         'reason', 'why', 'explanation', 'priority', 'problem_observed',
         'what_to_do_next_time', 'example_better_response_or_behavior',
@@ -303,8 +309,7 @@ def _extract_categories_flat_toon(text: str, field_name: str) -> str:
         'document_version_or_phase', 'category', 'name', 'type',
     }
 
-    # ── FORMAT A: inline brace {category,"Real Name",reason,"..."} ───────────
-    # Only if captured value is NOT a schema keyword (distinguishes from FORMAT B header)
+    # ── FORMAT A: {category,"Real Name",reason,"..."} ────────────────────────
     pat_a = re.compile(
         rf'{re.escape(field_name)}\[\d+\]\{{[^}}]*?category\s*,\s*"?([^",\}}]+)"?',
         re.IGNORECASE,
@@ -317,10 +322,10 @@ def _extract_categories_flat_toon(text: str, field_name: str) -> str:
         return "; ".join(dict.fromkeys(cats))
 
     # ── FORMAT B: {category,reason} SCHEMA HEADER then CSV data lines ────────
-    # Matches: field[N]{category,reason},   <- header defining column schema
-    #   Category Name,"reason text",        <- data rows
+    # Matches WITH or WITHOUT trailing comma after }
+    # field[N]{category,reason},   OR   field[N]{category,reason}
     pat_b = re.compile(
-        rf'^\s*{re.escape(field_name)}(?:\[\d+\])?\{{[^}}]*category[^}}]*reason[^}}]*\}}\s*,\s*$',
+        rf'^\s*{re.escape(field_name)}(?:\[\d+\])?\{{[^}}]*category[^}}]*reason[^}}]*\}}\s*,?\s*$',
         re.IGNORECASE | re.MULTILINE,
     )
     m_b = pat_b.search(text)
@@ -338,8 +343,8 @@ def _extract_categories_flat_toon(text: str, field_name: str) -> str:
             stripped = line.strip()
             if not stripped:
                 continue
-            # Each data line: Category Name,"reason text",
             # Extract first value before first unquoted comma
+            # Line: Category Name,"reason text",
             first_comma = -1
             in_quote = False
             qchar = None
@@ -405,9 +410,7 @@ def _extract_categories_flat_toon(text: str, field_name: str) -> str:
         for i, line in enumerate(after.split("\n")):
             if i > 30:
                 break
-            cm = re.match(
-                r'^\s*(?:-\s*)?category\s*,\s*(.+)$', line, re.IGNORECASE
-            )
+            cm = re.match(r'^\s*(?:-\s*)?category\s*,\s*(.+)$', line, re.IGNORECASE)
             if cm:
                 val = _strip_quotes(cm.group(1))
                 if val and val.lower() not in SCHEMA_WORDS:
@@ -490,6 +493,13 @@ def _parse_flat_toon(body: str) -> dict | None:
     # Reject if basically empty
     if not candidate_name and not chance and not verdict:
         return None
+
+    # Override action_required if ALL categories say "No Action Needed"
+    NO_ACTION = ("no action needed", "no action required", "none", "n/a")
+    if cac and all(any(p in c.lower() for p in NO_ACTION) for c in cac.split(";") if c.strip()):
+        cand_action = False
+    if pac and all(any(p in c.lower() for p in NO_ACTION) for c in pac.split(";") if c.strip()):
+        proxy_action = False
 
     return {
         "candidate_name":                  candidate_name,
@@ -609,6 +619,22 @@ def _parse_json(body: str) -> dict | None:
 
     if not candidate_name and not chance:
         return None
+
+    # ── Validate action_required against category content ────────────────────
+    # If ALL categories say "No Action Needed" → override action_required to False
+    NO_ACTION_PHRASES = ("no action needed", "no action required", "none", "n/a")
+
+    if cac and all(
+        any(p in cat.lower() for p in NO_ACTION_PHRASES)
+        for cat in cac.split(";") if cat.strip()
+    ):
+        cand_action = False
+
+    if pac and all(
+        any(p in cat.lower() for p in NO_ACTION_PHRASES)
+        for cat in pac.split(";") if cat.strip()
+    ):
+        proxy_action = False
 
     return {
         "candidate_name":                  candidate_name,
@@ -919,6 +945,42 @@ def _setup_tabs(ssvc, sid):
     ).execute()
     log.info(f"Tabs set up for {sid}")
 
+# ── Share sheet with configured emails ───────────────────────────────────────
+_shared_sheets = set()
+_shared_lk     = threading.Lock()
+
+def _share_sheet_with_team(dsvc, sid: str):
+    """
+    Share spreadsheet with SHARE_WITH_EMAILS as editors.
+    Only shares once per sheet per process run (cached in _shared_sheets).
+    """
+    with _shared_lk:
+        if sid in _shared_sheets:
+            return
+        _shared_sheets.add(sid)
+
+    for email in SHARE_WITH_EMAILS:
+        try:
+            dsvc.permissions().create(
+                fileId=sid,
+                body={
+                    "type":         "user",
+                    "role":         "writer",
+                    "emailAddress": email,
+                },
+                fields="id",
+                supportsAllDrives=True,
+                sendNotificationEmail=False,
+            ).execute()
+            log.info(f"✅ Shared {sid} with {email}")
+        except Exception as e:
+            # Already shared or no permission — not fatal
+            if "already" in str(e).lower() or "403" in str(e):
+                log.debug(f"Already shared {sid} with {email}")
+            else:
+                log.warning(f"Share failed {email}: {e}")
+
+
 # ── Append row with retry ─────────────────────────────────────────────────────
 def _append(ssvc, sid, tab, row):
     for attempt in range(6):
@@ -1057,6 +1119,9 @@ def process(item: dict) -> str:
     mf    = _folder(dsvc, month_name,    yf,   did)
     sname = f"{month_name}_{year}"
     sid   = _sheet(dsvc, ssvc, sname, mf, did)
+
+    # Share with team emails (once per sheet per run)
+    _share_sheet_with_team(dsvc, sid)
 
     # ── Step 8: Prepare values ────────────────────────────────────────────────
     yn           = lambda f: "Yes" if f else "No"
