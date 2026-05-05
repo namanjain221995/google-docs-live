@@ -14,9 +14,17 @@ Flow:
   3. Find REAL final S3 path — handles old path (mid inside path) and new path (mid at end)
   4. Check transcript exists — wait up to 60min with 6 retries
   5. Read doc.txt + TRANSCRIPT/*.vtt
-  6. Call LLM (Bedrock primary, OpenAI fallback)
-  7. Save llm.txt to final S3 path
-  8. Write llm-done.json to temp
+  6. Split large doc.txt into chunks (if > MAX_DOC_CHUNK chars)
+  7. Call LLM (Bedrock primary, OpenAI fallback) — each Part gets its own doc chunk
+  8. Save llm.txt to final S3 path
+  9. Write llm-done.json to temp
+
+Doc chunking:
+  If doc.txt > 150,000 chars → split into chunks
+  Part 1 → Doc chunk 1 (oldest content)
+  Part 2 → Doc chunk 2 (middle content)
+  Part 3 → Doc chunk 3 (newest content — most relevant)
+  OpenAI fallback → last 150K chars (most recent)
 
 Path formats handled (find_real_base_prefix):
   NEW path: Interview-Success/Host/Year/Month/Candidate/Company/Date/Round/MeetingID/
@@ -64,6 +72,10 @@ MAX_TRANSCRIPT_RETRIES = 6
 RETRY_WAIT_MINUTES     = 10
 SMART_SKIP_THRESHOLD   = 7
 
+# Large doc chunking — if doc.txt exceeds this, split into chunks
+# 150K chars ≈ 37K tokens — safe for both Bedrock and OpenAI context windows
+MAX_DOC_CHUNK = 150_000
+
 # All top-level S3 departments to search when doing meeting_id scan
 S3_DEPARTMENTS = [
     "Interview-Success",
@@ -92,6 +104,7 @@ _boto_cfg = Config(
     retries={"max_attempts": 5, "mode": "adaptive"},
     read_timeout=600,
     connect_timeout=10,
+    max_pool_connections=60,
 )
 s3c     = boto3.client("s3",               region_name=AWS_REGION, config=_boto_cfg)
 sm      = boto3.client("secretsmanager",   region_name=AWS_REGION, config=_boto_cfg)
@@ -144,29 +157,77 @@ def s3_put_text(key, text):
     )
 
 # ══════════════════════════════════════════════════════════════════════════════
+# DOC CHUNKING — split large doc.txt into parts
+# ══════════════════════════════════════════════════════════════════════════════
+
+def split_doc_chunks(doc_text: str) -> list:
+    """
+    Split large doc.txt into chunks of MAX_DOC_CHUNK chars.
+    Splits on newline boundaries to avoid cutting mid-line.
+
+    Returns list of strings:
+      - If doc fits in one chunk: [doc_text]
+      - If doc is large: [chunk1, chunk2, chunk3, ...]
+
+    Each Part call gets its assigned chunk:
+      Part 1 → chunk 0 (oldest doc versions)
+      Part 2 → chunk 1 (middle doc versions)
+      Part 3 → last chunk (newest/most recent doc versions)
+    """
+    if len(doc_text) <= MAX_DOC_CHUNK:
+        return [doc_text]
+
+    chunks = []
+    start  = 0
+    while start < len(doc_text):
+        end = start + MAX_DOC_CHUNK
+        if end < len(doc_text):
+            # Find nearest newline to avoid cutting mid-line
+            nl = doc_text.rfind("\n", start, end)
+            if nl > start:
+                end = nl
+        chunks.append(doc_text[start:end])
+        start = end
+
+    return chunks
+
+
+def get_doc_chunk_for_part(chunks: list, part_num: int, total_parts: int = 3) -> str:
+    """
+    Get the right doc chunk for a given LLM part.
+    Part 1 → first chunk (oldest content)
+    Part 2 → middle chunk
+    Part 3 → last chunk (newest/most relevant content)
+
+    If there are more than 3 chunks, Part 3 always gets the last one.
+    """
+    if len(chunks) == 1:
+        return chunks[0]
+
+    if part_num == 1:
+        return chunks[0]
+    elif part_num == 3:
+        return chunks[-1]
+    else:  # Part 2
+        mid = len(chunks) // 2
+        return chunks[mid]
+
+# ══════════════════════════════════════════════════════════════════════════════
 # PATH RESOLUTION — handles EVERY path format
 # ══════════════════════════════════════════════════════════════════════════════
 
 def extract_base_prefix(done: dict) -> tuple:
-    """
-    Extract raw base_prefix string from done.json.
-    This may be OLD path (meeting_id inside path) or NEW path (meeting_id at end).
-    Returns (raw_prefix, key_used)
-    """
     def clean(raw):
         return raw.replace(f"s3://{S3_BUCKET}/", "").rstrip("/").strip()
 
-    # 1. base_prefix field (written by llm_processor itself on re-process)
     bp = clean(done.get("base_prefix", ""))
     if bp:
         return bp, "base_prefix"
 
-    # 2. final_s3_prefix (doc_finalizer_worker — most common)
     bp = clean(done.get("final_s3_prefix", ""))
     if bp:
         return bp, "final_s3_prefix"
 
-    # 3. Extract from final_doc_txt by stripping /docs/doc.txt
     doc_txt_url = done.get("final_doc_txt", "")
     if doc_txt_url:
         bp = clean(doc_txt_url)
@@ -179,56 +240,26 @@ def extract_base_prefix(done: dict) -> tuple:
 
 
 def meeting_id_at_end_of_prefix(prefix: str, meeting_id: str) -> bool:
-    """
-    Return True if the prefix already ends with the meeting_id.
-    i.e. it is the NEW path format: .../Round/MeetingID
-    """
     parts = prefix.rstrip("/").split("/")
     return parts[-1] == meeting_id
 
 
 def find_real_base_prefix_by_scan(meeting_id: str) -> str:
-    """
-    Scan S3 across all departments to find the real folder that:
-      - contains the meeting_id in the path
-      - has a TRANSCRIPT/*.vtt inside it
-
-    Searches: Interview-Success/, Training/, Customer-Success/, Marketing/
-
-    Returns the real base_prefix (with meeting_id at end) or "" if not found.
-
-    Example:
-      Finds: Interview-Success/Harish_Sharma/2026/Month-4/
-             Dileep_Kumar_Koppisetti/Cisco/2026-04-24/Introduction_Call/
-             92349489464/TRANSCRIPT/1276ebf3.vtt
-      Returns: Interview-Success/Harish_Sharma/2026/Month-4/
-               Dileep_Kumar_Koppisetti/Cisco/2026-04-24/Introduction_Call/
-               92349489464
-    """
     for dept in S3_DEPARTMENTS:
         paginator = s3c.get_paginator("list_objects_v2")
         try:
-            for page in paginator.paginate(
-                Bucket=S3_BUCKET,
-                Prefix=f"{dept}/",
-            ):
+            for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=f"{dept}/"):
                 for obj in page.get("Contents", []):
                     key = obj["Key"]
-                    # Must contain meeting_id AND be a .vtt transcript
                     if meeting_id not in key:
                         continue
                     if not key.endswith(".vtt"):
                         continue
-                    # Key looks like: .../meeting_id/TRANSCRIPT/xxx.vtt
-                    # base_prefix = everything before /TRANSCRIPT/
                     if "/TRANSCRIPT/" not in key:
                         continue
                     base = key.split("/TRANSCRIPT/")[0]
-                    # Verify meeting_id is the last segment of base
                     if base.rstrip("/").split("/")[-1] == meeting_id:
                         return base
-                    # If meeting_id is somewhere else in path, still use it
-                    # because the TRANSCRIPT is under this path
                     return base
         except Exception as e:
             log.warning(f"S3 scan error in {dept}: {e}")
@@ -236,23 +267,9 @@ def find_real_base_prefix_by_scan(meeting_id: str) -> str:
 
 
 def resolve_real_base_prefix(raw_prefix: str, meeting_id: str) -> str:
-    """
-    Given a raw prefix from done.json and the meeting_id, return the REAL
-    base_prefix where:
-      - doc.txt lives at base_prefix/docs/doc.txt
-      - transcript lives at base_prefix/TRANSCRIPT/*.vtt
-
-    Strategy:
-      1. If raw_prefix already ends with meeting_id → it's the NEW format → use it
-      2. If raw_prefix has meeting_id inside it (OLD format) → scan S3 for real path
-      3. If raw_prefix has no meeting_id at all → scan S3 for real path
-      4. Verify the resolved path has docs/doc.txt → if not, scan anyway
-    """
-    # Case 1: NEW format — meeting_id is already at end
     if meeting_id_at_end_of_prefix(raw_prefix, meeting_id):
         return raw_prefix
 
-    # Case 2 & 3: OLD format or unknown — scan S3 to find real path
     log.info(
         f"[{meeting_id}] Path does not end with meeting_id "
         f"(old format detected) — scanning S3 for real path..."
@@ -262,7 +279,6 @@ def resolve_real_base_prefix(raw_prefix: str, meeting_id: str) -> str:
         log.info(f"[{meeting_id}] ✅ Real path found via S3 scan: {real}")
         return real
 
-    # Case 4: Scan found nothing — fall back to raw_prefix and hope for the best
     log.warning(
         f"[{meeting_id}] ⚠️  S3 scan found nothing — using raw prefix: {raw_prefix}"
     )
@@ -273,7 +289,6 @@ def resolve_real_base_prefix(raw_prefix: str, meeting_id: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def parse_vtt(vtt_text: str) -> str:
-    """Convert VTT transcript to plain readable text."""
     lines = []
     for line in vtt_text.splitlines():
         line = line.strip()
@@ -290,10 +305,6 @@ def parse_vtt(vtt_text: str) -> str:
 
 
 def find_transcript_vtt(base_prefix: str) -> str:
-    """
-    Find the first .vtt file under base_prefix/TRANSCRIPT/
-    Returns the S3 key or "" if not found.
-    """
     try:
         resp = s3c.list_objects_v2(
             Bucket=S3_BUCKET,
@@ -309,7 +320,6 @@ def find_transcript_vtt(base_prefix: str) -> str:
 
 
 def has_transcript(base_prefix: str) -> bool:
-    """Return True if TRANSCRIPT/*.vtt exists under base_prefix."""
     key = find_transcript_vtt(base_prefix)
     if key:
         log.info(f"Transcript found: {key}")
@@ -318,7 +328,6 @@ def has_transcript(base_prefix: str) -> bool:
 
 
 def get_transcript_text(base_prefix: str) -> str:
-    """Read TRANSCRIPT/*.vtt and return plain text."""
     key = find_transcript_vtt(base_prefix)
     if not key:
         return ""
@@ -398,9 +407,6 @@ def should_retry_now(state: dict) -> bool:
 
 def transcript_wait_check(meeting_id: str, temp_prefix: str,
                            base_prefix: str) -> str:
-    """
-    Returns: "go" / "wait" / "stop"
-    """
     if has_transcript(base_prefix):
         log.info(f"[{meeting_id}] ✅ Transcript found — proceeding")
         return "go"
@@ -437,10 +443,6 @@ def transcript_wait_check(meeting_id: str, temp_prefix: str,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def scan_s3_for_unprocessed() -> list:
-    """
-    Scan temp/live-doc-history/ for meetings that have:
-      done.json ✅  llm-done.json ❌  llm-error.json ❌
-    """
     paginator     = s3c.get_paginator("list_objects_v2")
     has_done      = {}
     has_llm_done  = set()
@@ -526,7 +528,6 @@ def is_throttle_error(e: Exception) -> bool:
 
 
 def call_openai_raw(messages: list) -> str:
-    """Raw OpenAI call. Returns response text."""
     api_key = get_openai_key()
     payload = json.dumps({
         "model":      OPENAI_MODEL_ID,
@@ -551,13 +552,24 @@ def call_openai_raw(messages: list) -> str:
 def run_llm_openai(doc_text: str, transcript_text: str,
                    meeting_id: str) -> tuple:
     """
-    Single-call OpenAI analysis.
-    GPT-4o-mini has 16K output — full analysis in ONE call, no splitting needed.
+    Single-call OpenAI fallback.
+    For large docs: use last MAX_DOC_CHUNK chars (most recent/relevant content).
     Returns (output_text, "openai")
     """
-    prompt     = get_prompt()
+    prompt = get_prompt()
+
+    # For large docs, OpenAI gets the most recent content (last chunk)
+    if len(doc_text) > MAX_DOC_CHUNK:
+        doc_for_llm = doc_text[-MAX_DOC_CHUNK:]
+        log.info(
+            f"[{meeting_id}] OpenAI: large doc truncated "
+            f"{len(doc_text):,} → {MAX_DOC_CHUNK:,} chars (last/newest content)"
+        )
+    else:
+        doc_for_llm = doc_text
+
     input_text = (
-        f"DOCUMENT:\n{doc_text}\n\n"
+        f"DOCUMENT:\n{doc_for_llm}\n\n"
         f"TRANSCRIPT:\n{transcript_text if transcript_text else 'N/A'}"
     )
     now_utc = datetime.now(timezone.utc)
@@ -585,14 +597,10 @@ def run_llm_openai(doc_text: str, transcript_text: str,
     return header + result, "openai"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LLM — BEDROCK (3-part split, 8K output per call)
+# LLM — BEDROCK (3-part split + doc chunking for large docs)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def call_bedrock_streaming(user_message: str, system_prompt: str) -> str:
-    """
-    Call Claude Haiku 4.5 via Bedrock with streaming + prompt caching.
-    Raises on any error — caller handles throttle fallback.
-    """
     body = json.dumps({
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens":        MAX_OUTPUT_TOKENS,
@@ -632,17 +640,23 @@ def call_bedrock_streaming(user_message: str, system_prompt: str) -> str:
 def run_llm_bedrock(doc_text: str, transcript_text: str,
                     meeting_id: str) -> tuple:
     """
-    3-part Bedrock call for Claude Haiku 4.5.
-    Haiku has 8K output limit per call — needs splitting.
+    3-part Bedrock call with doc chunking for large docs.
+
+    Normal doc (≤150K chars):
+      All 3 parts get the full doc — same as before.
+
+    Large doc (>150K chars):
+      Split into chunks. Each Part gets its assigned chunk:
+        Part 1 → chunk[0]  (oldest doc versions)
+        Part 2 → chunk[mid] (middle doc versions)
+        Part 3 → chunk[-1]  (newest/most recent doc versions)
 
     Smart skip: if Part 1 already has 7+/8 final sections → skip Parts 2+3.
     Returns (output_text, "bedrock")
     """
-    prompt     = get_prompt()
-    input_text = (
-        f"DOCUMENT:\n{doc_text}\n\n"
-        f"TRANSCRIPT:\n{transcript_text if transcript_text else 'N/A'}"
-    )
+    prompt  = get_prompt()
+    transcript = transcript_text if transcript_text else "N/A"
+
     now_utc = datetime.now(timezone.utc)
     header  = (
         f"LLM ANALYSIS REPORT\n"
@@ -663,15 +677,46 @@ def run_llm_bedrock(doc_text: str, transcript_text: str,
         "insufficient_context",
     ]
 
+    # ── Split doc into chunks if needed ───────────────────────────────────────
+    doc_chunks = split_doc_chunks(doc_text)
+    n_chunks   = len(doc_chunks)
+
+    if n_chunks > 1:
+        log.info(
+            f"[{meeting_id}] Large doc ({len(doc_text):,} chars) → "
+            f"{n_chunks} chunks of ~{MAX_DOC_CHUNK:,} chars each"
+        )
+    else:
+        log.info(f"[{meeting_id}] Doc: {len(doc_text):,} chars (single chunk)")
+
+    def make_input(part_num: int) -> str:
+        """Build DOCUMENT + TRANSCRIPT input for a given part number."""
+        doc_chunk = get_doc_chunk_for_part(doc_chunks, part_num)
+        if n_chunks > 1:
+            chunk_idx = {1: 0, 2: len(doc_chunks)//2, 3: len(doc_chunks)-1}[part_num]
+            chunk_label = f"[DOC PART {chunk_idx+1}/{n_chunks} — "
+            if part_num == 1:
+                chunk_label += "OLDEST CONTENT]\n"
+            elif part_num == 3:
+                chunk_label += "NEWEST/MOST RECENT CONTENT]\n"
+            else:
+                chunk_label += "MIDDLE CONTENT]\n"
+            doc_chunk = chunk_label + doc_chunk
+        return (
+            f"DOCUMENT:\n{doc_chunk}\n\n"
+            f"TRANSCRIPT:\n{transcript}"
+        )
+
     # ── Part 1 ────────────────────────────────────────────────────────────────
     log.info(f"[{meeting_id}] Bedrock Part 1 starting...")
+    inp1  = make_input(1)
     part1 = call_bedrock_streaming(
         f"{prompt}\n\n"
         f"OUTPUT PART 1: Generate these sections only:\n"
         f"audit_metadata, audit_summary_card, role_identification, "
         f"flat_summary, overall_dynamics_of_interview, "
         f"question_answer_support_mapping\n\n"
-        f"{input_text}",
+        f"{inp1}",
         prompt,
     )
     log.info(f"[{meeting_id}] Part 1 done ({len(part1)} chars)")
@@ -683,6 +728,7 @@ def run_llm_bedrock(doc_text: str, transcript_text: str,
 
     # ── Part 2 ────────────────────────────────────────────────────────────────
     log.info(f"[{meeting_id}] Bedrock Part 2 starting...")
+    inp2  = make_input(2)
     part2 = call_bedrock_streaming(
         f"{prompt}\n\n"
         f"CONTINUATION — Part 2.\n"
@@ -691,7 +737,7 @@ def run_llm_bedrock(doc_text: str, transcript_text: str,
         f"overall_candidate_performance, overall_proxy_support_performance, "
         f"overall_interviewer_performance, chance_of_moving_forward\n"
         f"DO NOT regenerate any section already in Part 1.\n\n"
-        f"{input_text}",
+        f"{inp2}",
         prompt,
     )
     log.info(f"[{meeting_id}] Part 2 done ({len(part2)} chars)")
@@ -704,6 +750,7 @@ def run_llm_bedrock(doc_text: str, transcript_text: str,
 
     # ── Part 3 ────────────────────────────────────────────────────────────────
     log.info(f"[{meeting_id}] Bedrock Part 3 starting...")
+    inp3  = make_input(3)
     part3 = call_bedrock_streaming(
         f"{prompt}\n\n"
         f"CONTINUATION — Part 3 (final).\n"
@@ -713,7 +760,7 @@ def run_llm_bedrock(doc_text: str, transcript_text: str,
         f"final_verdict, insufficient_context\n"
         f"DO NOT regenerate any section already written. "
         f"STOP after insufficient_context.\n\n"
-        f"{input_text}",
+        f"{inp3}",
         prompt,
     )
     log.info(f"[{meeting_id}] Part 3 done ({len(part3)} chars)")
@@ -724,7 +771,7 @@ def run_llm_3part(doc_text: str, transcript_text: str,
                   meeting_id: str) -> tuple:
     """
     Master LLM runner:
-      Try Bedrock (3-part split) → on throttle → fall back to OpenAI (1 call)
+      Try Bedrock (3-part split + doc chunking) → on throttle → OpenAI fallback
     Returns (output_text, provider)
     """
     # Primary: Bedrock
@@ -764,21 +811,25 @@ def process_one_meeting(item: dict) -> str:
     except Exception:
         return f"SKIP {mid} — done.json parse error"
 
-    # ── Step 2: Get raw prefix from done.json ─────────────────────────────────
+    # ── Step 2: Stub done.json check (no path) ────────────────────────────────
     raw_prefix, key_used = extract_base_prefix(done)
     if not raw_prefix:
-        return f"SKIP {mid} — no path found in done.json (keys: {list(done.keys())})"
+        # Stub done.json — no Google Doc activity, nothing to process
+        now_utc = datetime.now(timezone.utc)
+        s3_put_json(f"{pfx}/llm-error.json", {
+            "meeting_id":   mid,
+            "status":       "skipped_permanently",
+            "reason":       f"Stub done.json — no S3 path ({done.get('reason', 'no_doc_activity')})",
+            "done_keys":    list(done.keys()),
+            "error_at":     now_utc.isoformat(),
+            "error_at_ist": (now_utc + IST_OFFSET).strftime("%Y-%m-%d %I:%M:%S %p IST"),
+        })
+        log.info(f"[{mid}] ⏭️  Stub done.json — llm-error.json written, skip forever")
+        return f"SKIP {mid} — stub done.json (no path), skipped permanently"
 
     log.info(f"[{mid}] raw_prefix='{raw_prefix}' (from '{key_used}')")
 
-    # ── Step 3: Resolve REAL base_prefix (handle old/new/any path format) ─────
-    #
-    #   OLD path: .../Candidate/MeetingID/Company/Date/Round/Time  (mid inside)
-    #   NEW path: .../Candidate/Company/Date/Round/MeetingID       (mid at end)
-    #
-    #   resolve_real_base_prefix() figures out which format and returns
-    #   the correct path where TRANSCRIPT/ and docs/ actually live.
-    #
+    # ── Step 3: Resolve REAL base_prefix ──────────────────────────────────────
     base_prefix = resolve_real_base_prefix(raw_prefix, mid)
     log.info(f"[{mid}] base_prefix='{base_prefix}'")
 
@@ -793,23 +844,21 @@ def process_one_meeting(item: dict) -> str:
             f"{MAX_TRANSCRIPT_RETRIES} retries "
             f"({MAX_TRANSCRIPT_RETRIES * RETRY_WAIT_MINUTES} min)"
         )
-    # t_status == "go"
 
     # ── Step 5: Read doc.txt ──────────────────────────────────────────────────
     doc_txt = s3_read(f"{base_prefix}/docs/doc.txt")
     if not doc_txt:
-        # doc.txt might not exist at new path — try raw path as fallback
         log.warning(f"[{mid}] doc.txt not found at {base_prefix}/docs/doc.txt — trying raw path")
         doc_txt = s3_read(f"{raw_prefix}/docs/doc.txt")
     if not doc_txt:
         return f"SKIP {mid} — doc.txt not found at either path"
 
-    log.info(f"[{mid}] doc.txt: {len(doc_txt)} chars")
+    log.info(f"[{mid}] doc.txt: {len(doc_txt):,} chars")
 
     # ── Step 6: Read transcript ───────────────────────────────────────────────
     transcript_text = get_transcript_text(base_prefix)
     log.info(
-        f"[{mid}] Transcript: {len(transcript_text)} chars"
+        f"[{mid}] Transcript: {len(transcript_text):,} chars"
         f"{' (empty)' if not transcript_text else ''}"
     )
 
@@ -824,7 +873,7 @@ def process_one_meeting(item: dict) -> str:
     if not llm_output or len(llm_output) < 100:
         return f"ERROR {mid} — LLM returned empty output ({len(llm_output)} chars)"
 
-    log.info(f"[{mid}] LLM output: {len(llm_output)} chars via {provider}")
+    log.info(f"[{mid}] LLM output: {len(llm_output):,} chars via {provider}")
 
     # ── Step 8: Save llm.txt ──────────────────────────────────────────────────
     llm_key = f"{base_prefix}/llm/llm.txt"
@@ -838,6 +887,7 @@ def process_one_meeting(item: dict) -> str:
         else "gpt-4o-mini (OpenAI)"       if provider == "openai"
         else f"mixed ({provider})"
     )
+    doc_chunks_count = len(split_doc_chunks(doc_txt))
     s3_put_json(f"{pfx}/llm-done.json", {
         "meeting_id":       mid,
         "status":           "llm_processed",
@@ -847,6 +897,8 @@ def process_one_meeting(item: dict) -> str:
         "provider":         provider,
         "llm_txt":          f"s3://{S3_BUCKET}/{llm_key}",
         "doc_source":       f"s3://{S3_BUCKET}/{base_prefix}/docs/doc.txt",
+        "doc_chars":        len(doc_txt),
+        "doc_chunks":       doc_chunks_count,
         "transcript":       "found" if transcript_text else "N/A",
         "base_prefix":      base_prefix,
         "raw_prefix":       raw_prefix,
@@ -866,6 +918,7 @@ def process_one_meeting(item: dict) -> str:
     log.info(
         f"[{mid}] 💰 ~{input_tokens:,} in / ~{output_tokens:,} out "
         f"/ est ~${est_cost:.4f} / provider={provider}"
+        f"{f' / doc_chunks={doc_chunks_count}' if doc_chunks_count > 1 else ''}"
     )
 
     return f"OK {mid} | {len(llm_output):,} chars | ${est_cost:.4f} | {provider}"
@@ -934,6 +987,7 @@ def main():
     log.info(f"  Smart skip at:      {SMART_SKIP_THRESHOLD}/8 sections")
     log.info(f"  Transcript retries: {MAX_TRANSCRIPT_RETRIES} × {RETRY_WAIT_MINUTES}min")
     log.info(f"  Scan interval:      {SCAN_INTERVAL}s")
+    log.info(f"  Max doc chunk:      {MAX_DOC_CHUNK:,} chars")
     log.info(f"  Path resolution:    auto (new + old + S3 scan fallback)")
     log.info("=" * 60)
 
