@@ -526,7 +526,6 @@ def _parse_flat_toon(body: str) -> dict | None:
         "round_type":                      round_type,
         "duration":                        duration,
         "total_questions":                 total_questions,
-        "total_pastes":                    total_pastes,
     }
 
 
@@ -669,7 +668,6 @@ def _parse_json(body: str) -> dict | None:
         "round_type":                      round_type,
         "duration":                        duration,
         "total_questions":                 total_questions,
-        "total_pastes":                    total_pastes,
     }
 
 
@@ -688,7 +686,6 @@ def _default_result():
         "round_type":                      "",
         "duration":                        "",
         "total_questions":                 "",
-        "total_pastes":                    "",
     }
 
 
@@ -1258,7 +1255,7 @@ D_HDR = [
     "Candidate Action Required", "Proxy Support Action Required",
     "Candidate Action Categories", "Proxy Support Action Categories",
     "Candidate Score", "Proxy Score", "Verdict", "Round Type",
-    "Duration", "Total Questions", "Total Pastes",
+    "Duration", "Total Questions",
     "Candidate Evidence", "Proxy Evidence", "Questions",
 ]
 
@@ -1717,7 +1714,7 @@ def process(item: dict) -> str:
         date_str, sf_id, cand_name, is_person, mid, str(chance),
         cand_action, proxy_action,
         cac, pac, c_score, p_score, verdict, round_type,
-        duration, total_questions, total_pastes,
+        duration, total_questions,
         cand_ev_link, prxy_ev_link, quest_link,
     ], user_entered=True)
     log.info(f"[{mid}] ✅ Data tab written")
