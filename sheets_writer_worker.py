@@ -688,150 +688,196 @@ def _default_result():
 
 def _parse_markdown_tables(text, log_ref=None):
     """
-    Parse NEW prompt v3.0 output — Markdown tables + Session Overview + Final Verdict.
-
-    Extracts from TABLE 1 (Proxy) and TABLE 2 (Candidate):
-      - candidate_name, chance, action_required, categories
-
-    Also extracts from supporting sections:
-      - proxy_score, candidate_score (X/10 format)
-      - round_type (from Session Overview or audit_metadata)
-      - verdict (full Final Verdict text with all rationale points)
+    Parse ALL GPT-4o-mini and Bedrock markdown table formats:
+    - With title:  ## TABLE 1: PROXY ... / **Proxy Support Performance Table** / ### Table 1: ...
+    - Without title: raw | Date | SF ID | ... | header row directly
+    - Wrapped in ```markdown blocks
+    - Vertical key-value format: | **Date** | 2026-05-01 |
     """
     import re as _re
 
-    NO_ACTION_WORDS = ("no action needed", "none", "n/a", "no issues", "not applicable")
+    # Strip code fences
+    text = _re.sub(r"```[a-zA-Z]*\n", "", text)
+    text = _re.sub(r"```", "", text)
 
-    def get_last_table_row(txt, keyword):
-        """Find last table matching keyword, return first data row as cell list."""
-        results = []
-        lines = txt.split("\n")
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            if _re.search(r'TABLE.*' + _re.escape(keyword), line, _re.IGNORECASE):
-                j = i + 1
-                found_sep = False
-                while j < len(lines) and j < i + 10:
-                    l2 = lines[j].strip()
-                    if not l2:
-                        j += 1
-                        continue
-                    if _re.match(r'^\|[-| :]+\|$', l2):
-                        found_sep = True
-                        j += 1
-                        continue
-                    if found_sep and l2.startswith("|"):
-                        cells = [c.strip() for c in l2.split("|") if c.strip()]
-                        if len(cells) >= 4:
-                            results.append(cells)
-                            break
-                    j += 1
+    # Must have pipe tables
+    if "|" not in text:
+        return None
+
+    def clean(val):
+        val = _re.sub(r"\*\*([^*]*)\*\*", r"\1", val)
+        val = _re.sub(r"\*([^*]*)\*",   r"\1", val)
+        return val.lstrip("~").strip()
+
+    def is_sep(line):
+        return bool(_re.match(r"^\|[-| :]+\|$", line.strip()))
+
+    def parse_table_at(lines, start_idx):
+        """Given lines and index of header or title row, find data row."""
+        i = start_idx
+        found_header = False
+        found_sep    = False
+        while i < len(lines) and i < start_idx + 25:
+            l = lines[i].strip()
+            if not l:
+                i += 1
+                continue
+            if is_sep(l):
+                found_sep = True
+                i += 1
+                continue
+            if l.startswith("|"):
+                if found_sep:
+                    # This is a data row
+                    cells = [clean(c.strip()) for c in l.split("|") if c.strip()]
+                    if len(cells) >= 4:
+                        return cells
+                else:
+                    found_header = True
             i += 1
+        return None
+
+    lines = text.split("\n")
+
+    # Strategy 1: Find by TITLE keyword (## TABLE 1, **Proxy Support..., ### Table 1)
+    def find_by_title(keyword):
+        results = []
+        for i, line in enumerate(lines):
+            # Skip lines that are data rows (have dates)
+            if _re.search(r"\d{4}-\d{2}-\d{2}", line):
+                continue
+            if _re.search(keyword, line, _re.IGNORECASE):
+                row = parse_table_at(lines, i + 1)
+                if row:
+                    results.append(row)
         return results[-1] if results else None
 
-    if "TABLE 1" not in text and "TABLE 2" not in text:
-        return None
+    # Strategy 2: Find by COLUMN HEADER keywords
+    def find_by_column_header(col_keywords):
+        """Find table whose header row contains specific column keywords."""
+        results = []
+        for i, line in enumerate(lines):
+            if not line.strip().startswith("|"):
+                continue
+            # Check if this line looks like a header (has our keywords)
+            line_clean = clean(line).lower()
+            if all(kw.lower() in line_clean for kw in col_keywords):
+                # Check next line is separator
+                if i + 1 < len(lines) and is_sep(lines[i + 1].strip()):
+                    # Data is at i+2
+                    if i + 2 < len(lines):
+                        l2 = lines[i + 2].strip()
+                        if l2.startswith("|"):
+                            cells = [clean(c.strip()) for c in l2.split("|") if c.strip()]
+                            if len(cells) >= 4:
+                                results.append(cells)
+        return results[-1] if results else None
 
-    proxy_cells = get_last_table_row(text, "PROXY")
-    cand_cells  = get_last_table_row(text, "CANDIDATE")
+    # Strategy 3: Vertical table (| **Key** | Value |)
+    def find_vertical_table(key_map):
+        """Parse | Key | Value | style tables."""
+        result = {}
+        for line in lines:
+            if not line.strip().startswith("|"):
+                continue
+            cells = [clean(c.strip()) for c in line.split("|") if c.strip()]
+            if len(cells) == 2:
+                k, v = cells[0].lower(), cells[1]
+                for field, aliases in key_map.items():
+                    if any(a in k for a in aliases):
+                        result[field] = v
+        return result if len(result) >= 3 else None
 
+    # ── Try all strategies for PROXY table ─────────────────────────────────
+    proxy_cells = (
+        find_by_title("PROXY") or
+        find_by_column_header(["interview-success", "proxy support action"]) or
+        find_by_column_header(["interview-success person", "action required"])
+    )
+
+    # ── Try all strategies for CANDIDATE table ──────────────────────────────
+    cand_cells = (
+        find_by_title("CANDIDATE") or
+        find_by_column_header(["candidate name", "candidate action"]) or
+        find_by_column_header(["candidate name", "action required"])
+    )
+
+    # ── Vertical format fallback ────────────────────────────────────────────
+    vert = None
     if not proxy_cells and not cand_cells:
+        vert = find_vertical_table({
+            "date":           ["date"],
+            "sf_id":          ["salesforce", "interview id"],
+            "is_person":      ["interview-success person", "is person"],
+            "meeting_id":     ["meeting id"],
+            "chance":         ["chance"],
+            "proxy_action":   ["proxy support action required"],
+            "cand_action":    ["candidate action required"],
+            "cac":            ["candidate action categories"],
+            "pac":            ["proxy support action categories"],
+            "candidate_name": ["candidate name"],
+        })
+
+    if not proxy_cells and not cand_cells and not vert:
         return None
 
-    # ── Proxy table: Date|SF_ID|IS_Person|MeetingID|Chance|Action|Categories ──
-    pac              = ""
-    proxy_action_str = ""
-    if proxy_cells:
-        proxy_action_str = proxy_cells[5] if len(proxy_cells) > 5 else ""
-        pac              = proxy_cells[6] if len(proxy_cells) > 6 else ""
+    # ── Extract fields ──────────────────────────────────────────────────────
+    if vert:
+        pac            = vert.get("pac", "")
+        proxy_action   = vert.get("proxy_action", "")
+        candidate_name = vert.get("candidate_name", "")
+        chance         = vert.get("chance", "")
+        cand_action    = vert.get("cand_action", "")
+        cac            = vert.get("cac", "")
+    else:
+        # Proxy: Date|SF_ID|IS_Person|MeetingID|Chance|Action|Categories
+        pac              = ""
+        proxy_action_str = ""
+        if proxy_cells:
+            proxy_action_str = proxy_cells[5] if len(proxy_cells) > 5 else ""
+            pac              = proxy_cells[6] if len(proxy_cells) > 6 else ""
+        proxy_action = proxy_action_str
 
-    # ── Candidate table: SF_ID|Name|MeetingID|Chance|Action|Categories ─────────
-    candidate_name  = ""
-    chance          = ""
-    cand_action_str = ""
-    cac             = ""
-    if cand_cells:
-        candidate_name  = cand_cells[1] if len(cand_cells) > 1 else ""
-        chance          = cand_cells[3] if len(cand_cells) > 3 else ""
-        cand_action_str = cand_cells[4] if len(cand_cells) > 4 else ""
-        cac             = cand_cells[5] if len(cand_cells) > 5 else ""
+        # Candidate: SF_ID|Name|MeetingID|Chance|Action|Categories
+        candidate_name  = ""
+        chance          = ""
+        cand_action_str = ""
+        cac             = ""
+        if cand_cells:
+            candidate_name  = cand_cells[1] if len(cand_cells) > 1 else ""
+            chance          = cand_cells[3] if len(cand_cells) > 3 else ""
+            cand_action_str = cand_cells[4] if len(cand_cells) > 4 else ""
+            cac             = cand_cells[5] if len(cand_cells) > 5 else ""
+        cand_action = cand_action_str
 
-    if not chance and proxy_cells and len(proxy_cells) > 4:
-        chance = proxy_cells[4]
+        if not chance and proxy_cells and len(proxy_cells) > 4:
+            chance = proxy_cells[4]
 
-    # ── Raw action strings (no bool conversion) ──────────────────────────────
-    cand_action  = cand_action_str
-    proxy_action = proxy_action_str
+    # Clean candidate name
+    candidate_name = _re.sub(r"\s*\([A-Z]-\d+\)", "", candidate_name).strip()
 
-    # ── Clean candidate name ─────────────────────────────────────────────────
-    candidate_name = _re.sub(r'\s*\([A-Z]-\d+\)', '', candidate_name).strip()
-
-    # ── Round Type ────────────────────────────────────────────────────────────
+    # ── Round Type ─────────────────────────────────────────────────────────
     round_type = ""
     for rtp in [
-        r'\|\s*Round Type\s*\|\s*([^|\n]+)\|',
-        r'round_type_detected[,:\s]+([^\n,]+)',
-        r'Round Type[^|\n]*[|:]\s*([^|\n*]+)',
+        r"\|\s*Round Type\s*\|\s*([^|\n]+)\|",
+        r"round_type_detected[,:\s]+([^\n,]+)",
+        r"Round Type[:\s]+([A-Za-z][\w_]+)",
     ]:
         rm = _re.search(rtp, text, _re.IGNORECASE)
         if rm:
-            round_type = rm.group(1).strip().strip('*').strip()
+            val = rm.group(1).strip().strip("*").strip()
+            if val and not _re.match(r"^[\d./]+$", val):
+                round_type = val
             if round_type:
                 break
 
-    # ── Duration ──────────────────────────────────────────────────────────────
-    duration = ""
-    for dp in [
-        r'\|\s*(?:Session\s+)?Duration\s*\|\s*([^|\n]+)\|',
-        r'(?:Session\s+)?Duration[^|\n]*[|:]\s*([^|\n*]+)',
-        r'total_transcript_duration[,:\s]+([^\n,]+)',
-    ]:
-        dm = _re.search(dp, text, _re.IGNORECASE)
-        if dm:
-            duration = dm.group(1).strip().strip('*').strip()
-            if duration:
-                break
-
-    # ── Total Questions ───────────────────────────────────────────────────────
-    total_questions = ""
-    for qp in [
-        r'\|\s*Total Questions(?:\s+Asked)?\s*\|\s*([^|\n]+)\|',
-        r'Total Questions[^|\n]*[|:]\s*([^|\n*]+)',
-    ]:
-        qm = _re.search(qp, text, _re.IGNORECASE)
-        if qm:
-            total_questions = qm.group(1).strip().strip('*').strip()
-            # Extract just the number if mixed text like "8 primary questions + 5 follow-ups"
-            num = _re.match(r'(\d+)', total_questions)
-            if num:
-                total_questions = num.group(1)
-            if total_questions:
-                break
-
-    # ── Total Pastes ──────────────────────────────────────────────────────────
-    total_pastes = ""
-    for pp in [
-        r'\|\s*Total(?:\s+Doc)?\s+Pastes\s*\|\s*([^|\n]+)\|',
-        r'Total(?:\s+Doc)?\s+Pastes[^|\n]*[|:]\s*([^|\n*]+)',
-        r'document_versions_count[,:\s]+([^\n,]+)',
-    ]:
-        pm = _re.search(pp, text, _re.IGNORECASE)
-        if pm:
-            total_pastes = pm.group(1).strip().strip('*').strip()
-            num = _re.match(r'(\d+)', total_pastes)
-            if num:
-                total_pastes = num.group(1)
-            if total_pastes:
-                break
-
-    # ── Scores (X/10 format) ─────────────────────────────────────────────────
+    # ── Scores ─────────────────────────────────────────────────────────────
     proxy_score = ""
     cand_score  = ""
     for field, is_proxy in [("Proxy Score", True), ("Candidate Score", False)]:
         for sp in [
-            r'\|\s*' + _re.escape(field) + r'\s*\|\s*([\d.]+)\s*/\s*10\s*\|',
-            _re.escape(field) + r'[^\n]*?([\d.]+)\s*/\s*10',
+            r"\|\s*" + _re.escape(field) + r"\s*\|\s*([\d.]+)\s*/\s*10\s*\|",
+            _re.escape(field) + r"[^\n]*?([\d.]+)\s*/\s*10",
         ]:
             sm = _re.search(sp, text, _re.IGNORECASE)
             if sm:
@@ -839,26 +885,73 @@ def _parse_markdown_tables(text, log_ref=None):
                 if is_proxy:
                     proxy_score = val
                 else:
-                    cand_score = val
+                    cand_score  = val
                 break
 
-    # ── Full Final Verdict ────────────────────────────────────────────────────
+    # ── Duration & Total Questions ──────────────────────────────────────────
+    duration = ""
+    for dp in [
+        r"\|\s*(?:Session\s+)?Duration\s*\|\s*([^|\n]+)\|",
+        r"Duration[:\s]+([\d.]+\s*(?:min|minutes|hrs|hours)[^,\n]*)",
+        r"Duration[:\s]+([^,\n]{1,30})",
+    ]:
+        dm = _re.search(dp, text, _re.IGNORECASE)
+        if dm:
+            duration = dm.group(1).strip().strip("*").strip().rstrip(",")
+            if duration:
+                break
+
+    total_questions = ""
+    for qp in [
+        r"\|\s*Total Questions(?:\s+Asked)?\s*\|\s*([^|\n]+)\|",
+        r"Total Questions[:\s]+(\d+)",
+    ]:
+        qm = _re.search(qp, text, _re.IGNORECASE)
+        if qm:
+            tq = qm.group(1).strip().strip("*").strip()
+            num = _re.match(r"(\d+)", tq)
+            total_questions = num.group(1) if num else tq
+            if total_questions:
+                break
+
+    if not proxy_score:
+        for sp in [r"Proxy [Ss]core[:\s]+([\d.]+)\s*/\s*10", r"proxy_score[:\s]+([\d.]+)\s*/\s*10"]:
+            sm = _re.search(sp, text, _re.IGNORECASE)
+            if sm:
+                proxy_score = sm.group(1).strip() + "/10"
+                break
+    if not cand_score:
+        for sp in [r"Candidate [Ss]core[:\s]+([\d.]+)\s*/\s*10", r"candidate_score[:\s]+([\d.]+)\s*/\s*10"]:
+            sm = _re.search(sp, text, _re.IGNORECASE)
+            if sm:
+                cand_score = sm.group(1).strip() + "/10"
+                break
+    if not round_type:
+        for rtp in [
+            r"\|\s*Round Type\s*\|\s*([^|\n]+)\|",
+            r"Round [Tt]ype[:\s]+([A-Za-z][\w_]+)",
+            r"round_type[:\s]+([A-Za-z][\w_]+)",
+        ]:
+            rm = _re.search(rtp, text, _re.IGNORECASE)
+            if rm:
+                val = rm.group(1).strip().strip("*").strip()
+                if val and not _re.match(r"^[\d./]+$", val):
+                    round_type = val
+                    break
+
+    # ── Full Final Verdict ──────────────────────────────────────────────────
     verdict = ""
     for vp in [
-        r'##\s+Final Verdict\s*\n(.*?)(?=\n##|\Z)',
-        r'##\s+FINAL[_\s]VERDICT\s*\n(.*?)(?=\n##|\Z)',
-        r'final_verdict,\s*\n(.*?)(?=\n\w|\Z)',
+        r"##\s+Final Verdict\s*\n(.*?)(?=\n##|\Z)",
+        r"##\s+FINAL[_\s]VERDICT\s*\n(.*?)(?=\n##|\Z)",
     ]:
         vm = _re.search(vp, text, _re.IGNORECASE | _re.DOTALL)
         if vm:
             v = vm.group(1).strip()
-            # Clean markdown formatting
-            v = _re.sub(r'\*\*([^*]+)\*\*', r'\1', v)
-            v = _re.sub(r'#{1,4}\s+', '', v)
-            v = _re.sub(r'\n{3,}', '\n\n', v)
-            # Stop at next major section
-            for stop in ["## Insufficient", "## Mistake", "### Predicted",
-                         "insufficient_context", "## END OF"]:
+            v = _re.sub(r"\*\*([^*]*)\*\*", r"\1", v)
+            v = _re.sub(r"#{1,4}\s+", "", v)
+            v = _re.sub(r"\n{3,}", "\n\n", v)
+            for stop in ["## Insufficient", "## Mistake", "### Predicted", "insufficient_context", "## END OF"]:
                 idx2 = v.find(stop)
                 if idx2 > 0:
                     v = v[:idx2].strip()
@@ -882,7 +975,6 @@ def _parse_markdown_tables(text, log_ref=None):
         "round_type":                      round_type,
         "duration":                        duration,
         "total_questions":                 total_questions,
-        "total_pastes":                    total_pastes,
     }
 
 
@@ -1036,6 +1128,48 @@ def extract_questions_from_llm(text: str) -> list:
                 })
         elif in_table and header_found and stripped and stripped.startswith("#"):
             break
+
+    if not rows:
+        # Bullet format A (Title Case): - **Q&A Pair N**: Question: "...", Asked At: HH:MM:SS, ...
+        # Bullet format B (snake_case):  - Q&A pair: "question text", asked_at: HH:MM:SS, pasted_at: ..., delta_seconds: N, domain_type: X, speed_rating: Y
+        in_s = False
+        for line in text.split("\n"):
+            s2 = line.strip()
+            if re.search(r"Response Speed Analysis", s2, re.IGNORECASE):
+                in_s = True
+                continue
+            if not in_s:
+                continue
+            if s2.startswith("#") and "Speed" not in s2:
+                break
+            if not s2.startswith("-"):
+                continue
+
+            # Format A: Asked At / Pasted At (Title Case)
+            a_m  = re.search(r'(?:Asked At|asked_at)[:\s]+([\d:]+)', s2, re.IGNORECASE)
+            p_m  = re.search(r'(?:Pasted At|pasted_at)[:\s]+([\d:-]+)', s2, re.IGNORECASE)
+            d_m  = re.search(r'(?:Delta Seconds?|delta_seconds?)[:\s]+(-?\d+)', s2, re.IGNORECASE)
+            dt_m = re.search(r'(?:Domain Type|domain_type)[:\s]+([^,\n]+)', s2, re.IGNORECASE)
+            sp_m = re.search(r'(?:Speed Rating|speed_rating)[:\s]+(\w+)', s2, re.IGNORECASE)
+
+            # Question text: either format A "Question: text" or format B first quoted string
+            q_m  = re.search(r'Question[:\s]+"?([^",\n]+)', s2, re.IGNORECASE)
+            if not q_m:
+                # Format B: Q&A pair: "question text", asked_at: ...
+                q_m = re.search(r'Q&A pair[:\s]+"([^"]+)"', s2, re.IGNORECASE)
+            if not q_m:
+                # Fallback: first quoted string on the line
+                q_m = re.search(r'"([^"]{10,})"', s2)
+
+            if a_m or q_m:
+                rows.append({
+                    "question":  _clean_cell(q_m.group(1).strip()) if q_m else "",
+                    "asked_at":  _clean_cell(a_m.group(1).strip()) if a_m else "",
+                    "pasted_at": _clean_cell(p_m.group(1).strip()) if p_m else "",
+                    "delta_sec": d_m.group(1).strip() if d_m else "",
+                    "domain":    _clean_cell(dt_m.group(1).strip()) if dt_m else "",
+                    "speed":     sp_m.group(1).strip() if sp_m else "",
+                })
     return rows
 
 
@@ -1068,6 +1202,42 @@ def extract_proxy_evidence_from_llm(text: str) -> list:
                 })
         elif in_table and header_found and stripped and stripped.startswith("#"):
             break
+
+    if not rows:
+        # Format A: - **Category**: Version 5, Evidence text
+        # Format B: - Category: X, triggered by versions N, evidence: text
+        in_s = False
+        for line in text.split("\n"):
+            s2 = line.strip()
+            if re.search(r"Proxy Flag Details", s2, re.IGNORECASE):
+                in_s = True
+                continue
+            if not in_s:
+                continue
+            if s2.startswith("#") and "Proxy Flag" not in s2:
+                break
+            if not s2.startswith("-"):
+                continue
+
+            # Format A: - **Category Name**: Version 5, Evidence text
+            m_a = re.match(r"-\s*\*\*([^*]+)\*\*:\s*(.*)", s2)
+            # Format B: - Category: Name, triggered by versions N, evidence: text
+            m_b = re.match(r"-\s*Category:\s*([^,]+),\s*(.*)", s2, re.IGNORECASE)
+
+            if m_a:
+                rest = m_a.group(2).strip()
+                v_m = re.match(r"(Version[s]?\s*[\d,\s]+),\s*(.*)", rest, re.IGNORECASE)
+                if v_m:
+                    rows.append({"category": _clean_cell(m_a.group(1)), "doc_versions": v_m.group(1).strip(), "evidence": _clean_cell(v_m.group(2).strip())})
+                else:
+                    rows.append({"category": _clean_cell(m_a.group(1)), "doc_versions": "", "evidence": _clean_cell(rest)})
+            elif m_b:
+                rest  = m_b.group(2).strip()
+                ver_m = re.search(r"triggered by (?:versions?\s*)?([^,]+)", rest, re.IGNORECASE)
+                ev_m  = re.search(r"evidence:\s*(.*)", rest, re.IGNORECASE)
+                ver   = ver_m.group(1).strip() if ver_m else ""
+                ev    = _clean_cell(ev_m.group(1).strip()) if ev_m else _clean_cell(rest)
+                rows.append({"category": _clean_cell(m_b.group(1)), "doc_versions": ver, "evidence": ev})
     return rows
 
 
@@ -1100,6 +1270,42 @@ def extract_candidate_evidence_from_llm(text: str) -> list:
                 })
         elif in_table and header_found and stripped and stripped.startswith("#"):
             break
+
+    if not rows:
+        # Format A: - **Category**: VTT timestamp 00:02:30, Evidence text
+        # Format B: - Category: X, VTT timestamp: HH:MM:SS, evidence quote: "text"
+        in_s = False
+        for line in text.split("\n"):
+            s2 = line.strip()
+            if re.search(r"Candidate Flag Details", s2, re.IGNORECASE):
+                in_s = True
+                continue
+            if not in_s:
+                continue
+            if s2.startswith("#") and "Candidate Flag" not in s2:
+                break
+            if not s2.startswith("-"):
+                continue
+
+            # Format A: - **Category Name**: VTT timestamp 00:02:30, evidence text
+            m_a = re.match(r"-\s*\*\*([^*]+)\*\*:\s*(.*)", s2)
+            # Format B: - Category: Name, VTT timestamp: HH:MM:SS, evidence quote: "text"
+            m_b = re.match(r"-\s*Category:\s*([^,]+),\s*(.*)", s2, re.IGNORECASE)
+
+            if m_a:
+                rest = m_a.group(2).strip()
+                ts_m = re.match(r"(?:VTT\s*timestamp\s*)?([\d:]+),\s*(.*)", rest, re.IGNORECASE)
+                if ts_m:
+                    rows.append({"category": _clean_cell(m_a.group(1)), "vtt_timestamp": _clean_cell(ts_m.group(1).strip()), "evidence": _clean_cell(ts_m.group(2).strip())})
+                else:
+                    rows.append({"category": _clean_cell(m_a.group(1)), "vtt_timestamp": "", "evidence": _clean_cell(rest)})
+            elif m_b:
+                rest  = m_b.group(2).strip()
+                ts_m  = re.search(r"VTT timestamp:\s*([\d:]+)", rest, re.IGNORECASE)
+                ev_m  = re.search(r"evidence(?:\s*quote)?:\s*\"?([^\"\n]+)", rest, re.IGNORECASE)
+                ts    = _clean_cell(ts_m.group(1).strip()) if ts_m else ""
+                ev    = _clean_cell(ev_m.group(1).strip()) if ev_m else _clean_cell(rest)
+                rows.append({"category": _clean_cell(m_b.group(1)), "vtt_timestamp": ts, "evidence": ev})
     return rows
 
 # ── Path helpers ──────────────────────────────────────────────────────────────
@@ -1703,15 +1909,15 @@ def process(item: dict) -> str:
     _format_sheet(ssvc, sid)
 
     # ── Step 8: Prepare values ────────────────────────────────────────────────
-    cand_action  = str(parsed["candidate_action_required"]).strip()
-    proxy_action = str(parsed["proxy_support_action_required"]).strip()
-    chance       = parsed["chance"]
-    cac          = parsed["candidate_action_categories"]
-    pac          = parsed["proxy_support_action_categories"]
-    c_score      = parsed["candidate_score"]
-    p_score      = parsed["proxy_score"]
-    verdict      = parsed["verdict"]
-    round_type   = parsed["round_type"]
+    cand_action  = str(parsed.get("candidate_action_required", "")).strip()
+    proxy_action = str(parsed.get("proxy_support_action_required", "")).strip()
+    chance       = parsed.get("chance", "")
+    cac          = parsed.get("candidate_action_categories", "")
+    pac          = parsed.get("proxy_support_action_categories", "")
+    c_score      = parsed.get("candidate_score", "")
+    p_score      = parsed.get("proxy_score", "")
+    verdict      = parsed.get("verdict", "")
+    round_type   = parsed.get("round_type", "")
 
     # Routing logic
     # Routing: always write both Candidate and IS tabs
