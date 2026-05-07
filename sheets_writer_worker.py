@@ -52,7 +52,6 @@ SHARE_WITH_EMAILS = [
     "naman.jain@techsarasolutions.com",
     "rajvi.patel@techsarasolutions.com",
     "sahil.patel@techsarasolutions.com",
-    "techsphere@techsarasolutions.com",
 ]
 LIVE_POLL_INTERVAL   = 30
 BACKFILL_INTERVAL    = 120
@@ -485,10 +484,8 @@ def _parse_flat_toon(body: str) -> dict | None:
     )
 
     # ── action required flags ─────────────────────────────────────────────────
-    cand_action_str  = _get_field_flat_toon(body, "candidate_action_required")
-    proxy_action_str = _get_field_flat_toon(body, "proxy_support_action_required")
-    cand_action      = _to_bool(cand_action_str)
-    proxy_action     = _to_bool(proxy_action_str)
+    cand_action  = _get_field_flat_toon(body, "candidate_action_required")
+    proxy_action = _get_field_flat_toon(body, "proxy_support_action_required")
 
     # ── action categories ─────────────────────────────────────────────────────
     cac = _extract_categories_flat_toon(body, "candidate_action_categories")
@@ -515,13 +512,6 @@ def _parse_flat_toon(body: str) -> dict | None:
     # Reject if basically empty
     if not candidate_name and not chance and not verdict:
         return None
-
-    # Override action_required if ALL categories say "No Action Needed"
-    NO_ACTION = ("no action needed", "no action required", "none", "n/a")
-    if cac and all(any(p in c.lower() for p in NO_ACTION) for c in cac.split(";") if c.strip()):
-        cand_action = False
-    if pac and all(any(p in c.lower() for p in NO_ACTION) for c in pac.split(";") if c.strip()):
-        proxy_action = False
 
     return {
         "candidate_name":                  candidate_name,
@@ -677,14 +667,116 @@ def _default_result():
     return {
         "candidate_name":                  "",
         "chance":                          "",
-        "candidate_action_required":       False,
-        "proxy_support_action_required":   False,
+        "candidate_action_required":       "",
+        "proxy_support_action_required":   "",
         "candidate_action_categories":     "",
         "proxy_support_action_categories": "",
         "candidate_score":                 "",
         "proxy_score":                     "",
         "verdict":                         "",
         "round_type":                      "",
+    }
+
+
+def _parse_markdown_tables(text, log_ref=None):
+    import re as _re
+    NO_ACTION_WORDS = ("no action needed", "none", "n/a", "no issues", "not applicable")
+
+    def get_last_table_row(txt, keyword):
+        results = []
+        lines = txt.split("\n")
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if _re.search(r'TABLE.*' + _re.escape(keyword), line, _re.IGNORECASE):
+                # Find: header row → separator row → data row
+                j = i + 1
+                found_sep = False
+                while j < len(lines) and j < i + 10:
+                    l2 = lines[j].strip()
+                    if not l2:
+                        j += 1
+                        continue
+                    # Separator row: |---|---|
+                    if _re.match(r'^\|[-| :]+\|$', l2):
+                        found_sep = True
+                        j += 1
+                        continue
+                    # After separator: first pipe row = data row
+                    if found_sep and l2.startswith("|"):
+                        cells = [c.strip() for c in l2.split("|") if c.strip()]
+                        if len(cells) >= 4:
+                            results.append(cells)
+                            break
+                    j += 1
+            i += 1
+        return results[-1] if results else None
+
+    if "TABLE 1" not in text and "TABLE 2" not in text:
+        return None
+
+    proxy_cells = get_last_table_row(text, "PROXY")
+    cand_cells  = get_last_table_row(text, "CANDIDATE")
+
+    if not proxy_cells and not cand_cells:
+        return None
+
+    pac = ""
+    proxy_action_str = ""
+    if proxy_cells:
+        proxy_action_str = proxy_cells[5] if len(proxy_cells) > 5 else ""
+        pac              = proxy_cells[6] if len(proxy_cells) > 6 else ""
+
+    candidate_name  = ""
+    chance          = ""
+    cand_action_str = ""
+    cac             = ""
+    if cand_cells:
+        candidate_name  = cand_cells[1] if len(cand_cells) > 1 else ""
+        chance          = cand_cells[3] if len(cand_cells) > 3 else ""
+        cand_action_str = cand_cells[4] if len(cand_cells) > 4 else ""
+        cac             = cand_cells[5] if len(cand_cells) > 5 else ""
+
+    if not chance and proxy_cells and len(proxy_cells) > 4:
+        chance = proxy_cells[4]
+
+    def action_to_bool(action_str, cats):
+        a = action_str.lower().strip()
+        if a in ("good", "excellent"):
+            return False
+        if a in ("needs_improvement", "critical", "needs improvement"):
+            return True
+        if cats:
+            cat_list = [c.strip().lower() for c in cats.split(",") if c.strip()]
+            if cat_list and all(any(p in c for p in NO_ACTION_WORDS) for c in cat_list):
+                return False
+        return bool(cats and cats.strip())
+
+    # Use raw action strings directly from LLM output
+    cand_action  = cand_action_str
+    proxy_action = proxy_action_str
+
+    candidate_name = _re.sub(r'\s*\([A-Z]-\d+\)', '', candidate_name).strip()
+
+    round_type = ""
+    m = _re.search(r'Round Type[^|]*\|[^|]*\|\s*\**([^\n|*]+)', text, _re.IGNORECASE)
+    if m:
+        round_type = m.group(1).strip()
+
+    if not candidate_name and not chance:
+        return None
+
+    return {
+        "candidate_name":                  candidate_name,
+        "chance":                          chance,
+        "candidate_action_required":       cand_action,
+        "proxy_support_action_required":   proxy_action,
+        "candidate_action_categories":     cac,
+        "proxy_support_action_categories": pac,
+        "candidate_score":                 "",
+        "proxy_score":                     "",
+        "verdict":                         "",
+        "round_type":                      round_type,
     }
 
 
@@ -713,15 +805,22 @@ def parse_llm(llm_txt: str) -> dict:
     if sep:
         body = llm_txt[sep.end():]
 
-    # ── Attempt order: JSON body → FlatTOON body → JSON full → FlatTOON full ─
+    # ── Attempt order: Markdown Tables → JSON → FlatTOON ────────────────────
+    # Markdown tables = new prompt v3.0 format (priority)
+    # JSON = OpenAI old format
+    # FlatTOON = Bedrock old format
     for attempt_text, fmt in [
+        (llm_txt,  "markdown"),
+        (body,     "markdown"),
         (body,     "json"),
         (body,     "flat_toon"),
         (llm_txt,  "json"),
         (llm_txt,  "flat_toon"),
     ]:
         try:
-            if fmt == "json":
+            if fmt == "markdown":
+                result = _parse_markdown_tables(attempt_text)
+            elif fmt == "json":
                 result = _parse_json(attempt_text)
             else:
                 result = _parse_flat_toon(attempt_text)
@@ -1190,9 +1289,8 @@ def process(item: dict) -> str:
     _share_sheet_with_team(dsvc, sid)
 
     # ── Step 8: Prepare values ────────────────────────────────────────────────
-    yn           = lambda f: "Yes" if f else "No"
-    cand_action  = parsed["candidate_action_required"]
-    proxy_action = parsed["proxy_support_action_required"]
+    cand_action  = str(parsed["candidate_action_required"]).strip()
+    proxy_action = str(parsed["proxy_support_action_required"]).strip()
     chance       = parsed["chance"]
     cac          = parsed["candidate_action_categories"]
     pac          = parsed["proxy_support_action_categories"]
@@ -1202,20 +1300,16 @@ def process(item: dict) -> str:
     round_type   = parsed["round_type"]
 
     # Routing logic
-    write_c = cand_action  or (not cand_action and not proxy_action)
-    write_i = proxy_action or (not cand_action and not proxy_action)
-
-    routing_reason = (
-        "both_true"      if (cand_action and proxy_action) else
-        "candidate_only" if cand_action else
-        "proxy_only"     if proxy_action else
-        "both_false_write_both"
-    )
+    # Routing: always write both Candidate and IS tabs
+    # (Action Required is now raw string like "GOOD"/"NEEDS_IMPROVEMENT"/true/false)
+    write_c = True
+    write_i = True
+    routing_reason = "always_write_both"
 
     # ── Step 9: Write Data tab (ALWAYS) ───────────────────────────────────────
     _append(ssvc, sid, "Data", [
         date_str, sf_id, cand_name, is_person, mid, str(chance),
-        yn(cand_action), yn(proxy_action),
+        cand_action, proxy_action,
         cac, pac, c_score, p_score, verdict, round_type,
     ])
     log.info(f"[{mid}] ✅ Data tab written")
@@ -1223,14 +1317,14 @@ def process(item: dict) -> str:
     # ── Step 10: Candidate tab ────────────────────────────────────────────────
     if write_c:
         _append(ssvc, sid, "Candidate", [
-            date_str, sf_id, cand_name, mid, str(chance), yn(cand_action), cac,
+            date_str, sf_id, cand_name, mid, str(chance), cand_action, cac,
         ])
         log.info(f"[{mid}] ✅ Candidate tab written")
 
     # ── Step 11: Interview-Success tab ────────────────────────────────────────
     if write_i:
         _append(ssvc, sid, "Interview-Success", [
-            date_str, sf_id, is_person, mid, str(chance), yn(proxy_action), pac,
+            date_str, sf_id, is_person, mid, str(chance), proxy_action, pac,
         ])
         log.info(f"[{mid}] ✅ Interview-Success tab written")
 
