@@ -959,6 +959,16 @@ def _parse_markdown_tables(text, log_ref=None):
             if verdict:
                 break
 
+    # ── Validate — reject if we parsed a header row as data ─────────────────
+    _HEADER_WORDS = {
+        "candidate name", "name", "chance of moving", "chance %", "chance",
+        "action required", "meeting id", "salesforce", "interview id",
+        "date", "categories", "is person", "interview-success person",
+    }
+    if candidate_name.strip().lower() in _HEADER_WORDS:
+        log.warning(f"Parser matched header row as data (name={candidate_name!r}) — discarding")
+        return None
+
     if not candidate_name and not chance:
         return None
 
@@ -1485,9 +1495,9 @@ def _setup_tabs(ssvc, sid):
     ssvc.spreadsheets().values().batchUpdate(
         spreadsheetId=sid,
         body={"valueInputOption": "RAW", "data": [
-            {"range": "'Candidate'!A1",         "values": [C_HDR]},
-            {"range": "'Interview-Success'!A1", "values": [I_HDR]},
-            {"range": "'Data'!A1",              "values": [D_HDR]},
+            {"range": "Candidate!A1",         "values": [C_HDR]},
+            {"range": "Interview-Success!A1", "values": [I_HDR]},
+            {"range": "Data!A1",              "values": [D_HDR]},
         ]},
     ).execute()
     log.info(f"Tabs set up for {sid}")
@@ -1652,6 +1662,7 @@ def _append(ssvc, sid, tab, row, user_entered=False):
     Append a row to a sheet tab.
     user_entered=True: use USER_ENTERED so =HYPERLINK() formulas are evaluated.
     user_entered=False: use RAW for plain data (faster, no formula parsing).
+    Handles 429 rate limit and 400 "tab not found" by running _setup_tabs.
     """
     input_option = "USER_ENTERED" if user_entered else "RAW"
     for attempt in range(6):
@@ -1659,7 +1670,7 @@ def _append(ssvc, sid, tab, row, user_entered=False):
         try:
             ssvc.spreadsheets().values().append(
                 spreadsheetId=sid,
-                range=f"'{tab}'!A1",
+                range=f"{tab}!A1",
                 valueInputOption=input_option,
                 insertDataOption="INSERT_ROWS",
                 body={"values": [row]},
@@ -1667,13 +1678,23 @@ def _append(ssvc, sid, tab, row, user_entered=False):
             return
         except HttpError as e:
             if e.resp.status == 429:
-                wait = (2 ** attempt) * 5
-                log.warning(
-                    f"429 tab='{tab}' attempt {attempt+1}/6 sleep {wait}s"
-                )
+                wait = min((2 ** attempt) * 3, 30)
+                log.warning(f"429 tab='{tab}' attempt {attempt+1}/6 sleep {wait}s")
                 time.sleep(wait)
                 if attempt == 5:
                     raise
+            elif e.resp.status == 400 and "Unable to parse range" in str(e):
+                # Tab doesn't exist yet — run setup and retry
+                log.warning(f"400 tab='{tab}' not found — running _setup_tabs (attempt {attempt+1}/6)")
+                try:
+                    _setup_tabs(ssvc, sid)
+                    time.sleep(2)
+                except Exception as se:
+                    log.warning(f"_setup_tabs error: {se}")
+                if attempt == 5:
+                    log.error(f"400 tab='{tab}' still not found after 6 attempts — giving up")
+                    raise
+                continue  # Retry the append
             else:
                 log.error(f"Sheets error tab='{tab}': {e}")
                 raise
@@ -1789,7 +1810,7 @@ def append_rows_to_sheet(ssvc, sid: str, rows: list, headers: list = None):
             return
         except HttpError as e:
             if e.resp.status == 429:
-                wait = (2 ** attempt) * 5
+                wait = min((2 ** attempt) * 3, 30)  # Cap at 30s
                 log.warning(f"429 evidence sheet {sid} attempt {attempt+1}/6 sleep {wait}s")
                 time.sleep(wait)
                 if attempt == 5:
