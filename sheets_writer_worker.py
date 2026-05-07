@@ -1193,17 +1193,33 @@ def parse_llm(llm_txt: str) -> dict:
 import hashlib
 try:
     from openai import OpenAI as _OpenAI
-    _openai_client = None
-    def _get_openai():
-        global _openai_client
-        if _openai_client is None:
-            api_key = os.getenv("OPENAI_API_KEY", "")
-            if not api_key:
-                return None
+    _OPENAI_IMPORT_OK = True
+except ImportError as _e:
+    _OPENAI_IMPORT_OK = False
+    _OPENAI_IMPORT_ERR = str(_e)
+    log.error(f"OpenAI library NOT installed: {_e}. Run: pip3 install openai --user --break-system-packages")
+
+_openai_client = None
+def _get_openai():
+    """Get cached OpenAI client. Logs why it fails on first call."""
+    global _openai_client
+    if not _OPENAI_IMPORT_OK:
+        return None
+    if _openai_client is None:
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            log.error("OPENAI_API_KEY env var not set! Add it to /home/ec2-user/google-docs-live/env")
+            return None
+        if not api_key.startswith("sk-"):
+            log.error(f"OPENAI_API_KEY looks invalid (starts with {api_key[:5]!r})")
+            return None
+        try:
             _openai_client = _OpenAI(api_key=api_key)
-        return _openai_client
-except ImportError:
-    _get_openai = lambda: None
+            log.info(f"OpenAI client initialized (key {api_key[:8]}...{api_key[-4:]})")
+        except Exception as e:
+            log.error(f"Failed to create OpenAI client: {e}")
+            return None
+    return _openai_client
 
 
 # JSON schema for structured output — guarantees consistent shape
@@ -1372,7 +1388,10 @@ def parse_llm_with_gpt(text: str) -> dict:
         log.info(f"  LLM parser ✅ name={parsed.get('candidate_name','')!r} chance={parsed.get('chance','')!r}")
         return parsed
     except Exception as e:
-        log.warning(f"LLM parser error: {e}")
+        # Log full exception details — not just the message
+        import traceback
+        log.error(f"LLM parser FAILED: {type(e).__name__}: {e}")
+        log.error(f"Traceback: {traceback.format_exc()[:500]}")
         return None
 
 
@@ -2044,9 +2063,66 @@ PRXY_EVIDENCE_HDR = ["Proxy Action Category",     "Doc Versions",  "Evidence"]
 QUESTIONS_HDR     = ["Question", "Asked At", "Pasted At", "Delta Seconds", "Domain Type", "Speed Rating"]
 
 
+
+def _validate_candidate_name(name: str) -> str:
+    """
+    Validate that a candidate name looks like a real person's name.
+    Rejects narrative text, category labels, action words, placeholders.
+    Returns cleaned name or empty string.
+    """
+    if not name or not str(name).strip():
+        return ""
+    n = str(name).strip()
+    n = n.replace("**", "").replace("*", "").strip()
+    nl = n.lower()
+    REJECT_EXACT = {
+        "unknown", "n/a", "na", "candidate name", "name", "high", "low",
+        "critical", "good", "excellent", "needs_improvement", "moderate",
+        "proxy", "candidate", "acceptable", "proxy coordination",
+        "candidate coordination", "claude fine-tuning confusion",
+    }
+    if nl in REJECT_EXACT:
+        return ""
+    REJECT_KEYWORDS = ["confusion", "coordination", "transcript", "analysis",
+                       "evidence", "rating", "version", "response", "polished",
+                       "scripted", "interviewer", "candidate forced", "answers",
+                       "noted at", "demonstrates", "exposed", "round"]
+    for kw in REJECT_KEYWORDS:
+        if kw in nl:
+            return ""
+    if len(n) > 50:
+        return ""
+    bad_patterns = [
+        r'["“”]',
+        r"[:;]",
+        r"\.\.\.",
+        r"[\(\[].{3,}[\)\]]",
+        r"\d{2,}",
+        r"[→—–]",
+        r"[!?]",
+        r"\.[A-Za-z]",
+        r"[a-z]\.\s*$",
+    ]
+    for p in bad_patterns:
+        if re.search(p, n):
+            return ""
+    words = n.split()
+    if len(words) < 1 or len(words) > 5:
+        return ""
+    if not words[0][0].isalpha():
+        return ""
+    return n
+
+
 def _safe_sheet_name(name: str) -> str:
-    """Make a safe Google Sheets tab/file name (max 100 chars, no special chars)."""
-    safe = re.sub(r'[/\\\[\]\*\?\:]', " ", name).strip()
+    """Make a safe Google Sheets tab/file name (max 100 chars, no quotes/special chars)."""
+    if not name or not str(name).strip():
+        return "Unknown"
+    # Remove characters that break Drive API queries or sheet names:
+    # / \ [ ] * ? : ' " — and all control chars
+    safe = re.sub(r"[/\\\[\]\*\?\:\'\"`]", " ", str(name))
+    # Collapse multiple spaces
+    safe = re.sub(r"\s+", " ", safe).strip()
     return safe[:100] if safe else "Unknown"
 
 
@@ -2234,7 +2310,7 @@ def process(item: dict) -> str:
 
     log.info(f"[{mid}] llm.txt: {len(llm_txt)} chars")
 
-    # ── Step 4: Parse LLM output (regex first, GPT-4o-mini fallback) ─────────
+    # ── Step 4: Parse LLM output (GPT-4o-mini only) ───────────────────────────
     parsed, q_rows, ce_rows, pe_rows = parse_llm_smart(llm_txt)
     # parsed always has all keys — never None, never {}
 
@@ -2248,10 +2324,40 @@ def process(item: dict) -> str:
         f"pac='{parsed.get('proxy_support_action_categories','')[:50]}'"
     )
 
+    # ── Skip if LLM parser returned completely empty data (likely API failure) ─
+    # This way we don't write garbage rows; the worker will retry on next pass.
+    has_any_data = bool(
+        parsed.get("candidate_name", "").strip() or
+        parsed.get("chance", "").strip() or
+        parsed.get("candidate_action_required", "").strip() or
+        parsed.get("proxy_support_action_required", "").strip() or
+        q_rows or ce_rows or pe_rows
+    )
+    if not has_any_data:
+        # Track failures with retry counter — give up after 3 attempts
+        fail_key = f"{pfx}/llm-parse-failed.json"
+        try:
+            resp = s3.get_object(Bucket=BUCKET, Key=fail_key)
+            fail_data = json.loads(resp["Body"].read().decode("utf-8"))
+            attempts = int(fail_data.get("attempts", 0)) + 1
+        except Exception:
+            attempts = 1
+        s3_put_json(fail_key, {"attempts": attempts, "last_error": "GPT returned empty"})
+
+        if attempts < 3:
+            log.error(f"[{mid}] ❌ LLM parser EMPTY (attempt {attempts}/3) — will retry next run")
+            log.error(f"[{mid}]    Check: 1) openai installed  2) OPENAI_API_KEY  3) API quota/status")
+            return  # Don't write — will retry
+        else:
+            log.error(f"[{mid}] ❌ LLM parser failed 3 times — writing empty row to unblock pipeline")
+            # Continue with empty data so we mark sheets-done and stop retrying
+
     # ── Step 5: Salesforce ────────────────────────────────────────────────────
     sf        = query_sf(mid)
     sf_id     = sf.get("sf_id", "")
-    cand_name = sf.get("name") or parsed.get("candidate_name", "") or "Unknown"
+    raw_name  = sf.get("name") or parsed.get("candidate_name", "") or ""
+    # Validate name — reject garbage like "Over-polished paste language..." or "CRITICAL"
+    cand_name = _validate_candidate_name(raw_name) or "Unknown"
     date_str  = (
         sf.get("date")
         or (datetime.now(timezone.utc) + IST).strftime("%Y-%m-%d")
