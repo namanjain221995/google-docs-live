@@ -522,7 +522,6 @@ def _parse_flat_toon(body: str) -> dict | None:
         "proxy_support_action_categories": pac,
         "candidate_score":                 cand_score,
         "proxy_score":                     proxy_score,
-        "verdict":                         verdict,
         "round_type":                      round_type,
         "duration":                        duration,
         "total_questions":                 total_questions,
@@ -664,7 +663,6 @@ def _parse_json(body: str) -> dict | None:
         "proxy_support_action_categories": pac,
         "candidate_score":                 cand_score,
         "proxy_score":                     proxy_score,
-        "verdict":                         verdict,
         "round_type":                      round_type,
         "duration":                        duration,
         "total_questions":                 total_questions,
@@ -682,7 +680,6 @@ def _default_result():
         "proxy_support_action_categories": "",
         "candidate_score":                 "",
         "proxy_score":                     "",
-        "verdict":                         "",
         "round_type":                      "",
         "duration":                        "",
         "total_questions":                 "",
@@ -1254,7 +1251,7 @@ D_HDR = [
     "Chance of Moving to Next Round %",
     "Candidate Action Required", "Proxy Support Action Required",
     "Candidate Action Categories", "Proxy Support Action Categories",
-    "Candidate Score", "Proxy Score", "Verdict", "Round Type",
+    "Candidate Score", "Proxy Score", "Round Type",
     "Duration", "Total Questions",
     "Candidate Evidence", "Proxy Evidence", "Questions",
 ]
@@ -1367,6 +1364,80 @@ def _share_sheet_with_team(dsvc, sid: str):
             log.info(f"✅ Shared {sid} with {email}")
         except Exception as e:
             log.warning(f"Share failed {email}: {e}")
+
+
+# ── Sheet formatting: bold headers + column widths ────────────────────────────
+_formatted_sheets = set()
+_fmt_lk = threading.Lock()
+
+def _format_sheet(ssvc, sid: str):
+    """
+    Apply formatting to the sheet ONCE per run:
+    - Bold + freeze header row on all tabs
+    - Auto-resize all columns
+    Only runs once per spreadsheet per process run.
+    """
+    with _fmt_lk:
+        if sid in _formatted_sheets:
+            return
+        _formatted_sheets.add(sid)
+
+    try:
+        meta   = ssvc.spreadsheets().get(spreadsheetId=sid).execute()
+        sheets = meta.get("sheets", [])
+        reqs   = []
+
+        for sheet in sheets:
+            gid   = sheet["properties"]["sheetId"]
+            title = sheet["properties"]["title"]
+            ncols = len(D_HDR) if title == "Data" else                     len(C_HDR) if title == "Candidate" else                     len(I_HDR) if title == "Interview-Success" else 10
+
+            # Bold + background on header row
+            reqs.append({"repeatCell": {
+                "range": {"sheetId": gid, "startRowIndex": 0, "endRowIndex": 1,
+                          "startColumnIndex": 0, "endColumnIndex": ncols},
+                "cell": {"userEnteredFormat": {
+                    "textFormat":        {"bold": True, "fontSize": 11},
+                    "backgroundColor":   {"red": 0.23, "green": 0.47, "blue": 0.85},
+                    "foregroundColor":   {"red": 1.0,  "green": 1.0,  "blue": 1.0},
+                    "horizontalAlignment": "CENTER",
+                    "verticalAlignment":   "MIDDLE",
+                    "wrapStrategy":      "WRAP",
+                }},
+                "fields": "userEnteredFormat(textFormat,backgroundColor,foregroundColor,horizontalAlignment,verticalAlignment,wrapStrategy)",
+            }})
+
+            # Freeze header row
+            reqs.append({"updateSheetProperties": {
+                "properties": {"sheetId": gid,
+                               "gridProperties": {"frozenRowCount": 1}},
+                "fields": "gridProperties.frozenRowCount",
+            }})
+
+            # Set column widths
+            col_widths = {
+                "Data": [90, 130, 160, 130, 120, 80, 120, 120, 250, 250,
+                         80, 80, 120, 80, 80, 130, 130, 130],
+                "Candidate": [90, 130, 160, 120, 80, 120, 250],
+                "Interview-Success": [90, 130, 130, 120, 80, 120, 250],
+            }
+            widths = col_widths.get(title, [150] * ncols)
+            for ci, w in enumerate(widths[:ncols]):
+                reqs.append({"updateDimensionProperties": {
+                    "range": {"sheetId": gid, "dimension": "COLUMNS",
+                              "startIndex": ci, "endIndex": ci + 1},
+                    "properties": {"pixelSize": w},
+                    "fields": "pixelSize",
+                }})
+
+        if reqs:
+            ssvc.spreadsheets().batchUpdate(
+                spreadsheetId=sid, body={"requests": reqs}
+            ).execute()
+            log.info(f"✅ Sheet formatted: bold headers + column widths → {sid}")
+
+    except Exception as e:
+        log.warning(f"Format sheet error {sid}: {e}")
 
 
 # ── Append row with retry ─────────────────────────────────────────────────────
@@ -1628,6 +1699,9 @@ def process(item: dict) -> str:
     # Share with team emails (once per sheet per run)
     _share_sheet_with_team(dsvc, sid)
 
+    # Format sheet: bold headers + column widths (once per sheet per run)
+    _format_sheet(ssvc, sid)
+
     # ── Step 8: Prepare values ────────────────────────────────────────────────
     cand_action  = str(parsed["candidate_action_required"]).strip()
     proxy_action = str(parsed["proxy_support_action_required"]).strip()
@@ -1704,16 +1778,33 @@ def process(item: dict) -> str:
     quest_link    = make_hyperlink(sheet_url(quest_sid),   "Questions")          if quest_sid   else ""
 
     # ── Step 15: Write Data tab (ALWAYS) ──────────────────────────────────────
+    # Clean markdown from all parsed string fields
+    def _clean_md(val):
+        """Remove **bold**, *italic*, leading ~ from any cell value."""
+        import re as _r
+        if not isinstance(val, str): return val
+        val = _r.sub(r'\*\*([^*]*)\*\*', r'\1', val)
+        val = _r.sub(r'\*([^*]*)\*',   r'\1', val)
+        return val.lstrip('~').strip()
+
+    cand_action  = _clean_md(cand_action)
+    proxy_action = _clean_md(proxy_action)
+    cac          = _clean_md(cac)
+    pac          = _clean_md(pac)
+    c_score      = _clean_md(c_score)
+    p_score      = _clean_md(p_score)
+    round_type   = _clean_md(round_type)
+
     # Pull new fields from parsed
-    duration        = parsed.get("duration", "")
-    total_questions = parsed.get("total_questions", "")
+    duration        = _clean_md(parsed.get("duration", ""))
+    total_questions = _clean_md(parsed.get("total_questions", ""))
     total_pastes    = parsed.get("total_pastes", "")
 
     # Data tab uses USER_ENTERED so =HYPERLINK() formulas are clickable
     _append(ssvc, sid, "Data", [
         date_str, sf_id, cand_name, is_person, mid, str(chance),
         cand_action, proxy_action,
-        cac, pac, c_score, p_score, verdict, round_type,
+        cac, pac, c_score, p_score, round_type,
         duration, total_questions,
         cand_ev_link, prxy_ev_link, quest_link,
     ], user_entered=True)
