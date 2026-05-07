@@ -630,6 +630,28 @@ def _parse_json(body: str) -> dict | None:
         or ""
     )
 
+    # ── Normalize duration to consistent format ────────────────────────────────
+    if duration:
+        d = duration.strip()
+        dl = d.lower()
+        # "1 hour 6 minutes" → "66 minutes"
+        h_m = _re.match(r"(\d+)\s*hours?\s*(\d+)\s*min", dl)
+        if h_m:
+            duration = str(int(h_m.group(1)) * 60 + int(h_m.group(2))) + " minutes"
+        # "1 hour" or "2 hours" → "60 minutes"
+        elif _re.match(r"(\d+)\s*hours?\s*$", dl):
+            h_m2 = _re.match(r"(\d+)", dl)
+            duration = str(int(h_m2.group(1)) * 60) + " minutes"
+        # "Approximately 45 minutes" / "approximately 45" → "45 minutes"
+        elif _re.match(r"approx", dl):
+            a_m = _re.search(r"(\d+)", dl)
+            if a_m:
+                duration = a_m.group(1) + " minutes"
+        # "60 mins" → "60 minutes"
+        elif _re.match(r"(\d+)\s*mins?\s*$", dl):
+            mn_m = _re.match(r"(\d+)", dl)
+            duration = mn_m.group(1) + " minutes"
+
     if not candidate_name and not chance:
         return None
 
@@ -712,11 +734,19 @@ def _parse_markdown_tables(text, log_ref=None):
     def is_sep(line):
         return bool(_re.match(r"^\|[-| :]+\|$", line.strip()))
 
+    # Known header cell values — never treat these as data
+    _HEADER_CELLS = {
+        "date", "salesforce interview id", "interview-success person",
+        "meeting id", "chance of moving to next round %", "chance %",
+        "action required", "proxy support action categories",
+        "candidate action categories", "candidate name", "sf id",
+        "is person", "categories", "chance", "action",
+    }
+
     def parse_table_at(lines, start_idx):
         """Given lines and index of header or title row, find data row."""
         i = start_idx
-        found_header = False
-        found_sep    = False
+        found_sep = False
         while i < len(lines) and i < start_idx + 25:
             l = lines[i].strip()
             if not l:
@@ -728,12 +758,17 @@ def _parse_markdown_tables(text, log_ref=None):
                 continue
             if l.startswith("|"):
                 if found_sep:
-                    # This is a data row
                     cells = [clean(c.strip()) for c in l.split("|") if c.strip()]
                     if len(cells) >= 4:
+                        # Reject if first cell looks like a header
+                        if cells[0].lower().strip() in _HEADER_CELLS:
+                            i += 1
+                            continue
+                        # Reject if looks like a VTT timestamp row (date col = HH:MM:SS)
+                        if _re.match(r"^\d{2}:\d{2}(:\d{2})?$", cells[0].strip()):
+                            i += 1
+                            continue
                         return cells
-                else:
-                    found_header = True
             i += 1
         return None
 
@@ -791,15 +826,15 @@ def _parse_markdown_tables(text, log_ref=None):
     # ── Try all strategies for PROXY table ─────────────────────────────────
     proxy_cells = (
         find_by_title("PROXY") or
-        find_by_column_header(["interview-success", "proxy support action"]) or
-        find_by_column_header(["interview-success person", "action required"])
+        find_by_column_header(["interview-success person", "proxy support action categories"]) or
+        find_by_column_header(["interview-success person", "proxy support action required"])
     )
 
     # ── Try all strategies for CANDIDATE table ──────────────────────────────
     cand_cells = (
         find_by_title("CANDIDATE") or
-        find_by_column_header(["candidate name", "candidate action"]) or
-        find_by_column_header(["candidate name", "action required"])
+        find_by_column_header(["candidate name", "candidate action categories"]) or
+        find_by_column_header(["candidate name", "candidate action required"])
     )
 
     # ── Vertical format fallback ────────────────────────────────────────────
@@ -844,10 +879,19 @@ def _parse_markdown_tables(text, log_ref=None):
         cand_action_str = ""
         cac             = ""
         if cand_cells:
+            # Find name — must be a non-numeric, non-ID looking cell
+            # Typical order: SF_ID | Name | MeetingID | Chance | Action | Categories
             candidate_name  = cand_cells[1] if len(cand_cells) > 1 else ""
-            chance          = cand_cells[3] if len(cand_cells) > 3 else ""
-            cand_action_str = cand_cells[4] if len(cand_cells) > 4 else ""
-            cac             = cand_cells[5] if len(cand_cells) > 5 else ""
+            # If name looks like a meeting ID (all digits), shift right
+            if candidate_name and _re.match(r"^[\d]{6,}$", candidate_name.strip()):
+                candidate_name  = cand_cells[2] if len(cand_cells) > 2 else ""
+                chance          = cand_cells[3] if len(cand_cells) > 3 else ""
+                cand_action_str = cand_cells[4] if len(cand_cells) > 4 else ""
+                cac             = cand_cells[5] if len(cand_cells) > 5 else ""
+            else:
+                chance          = cand_cells[3] if len(cand_cells) > 3 else ""
+                cand_action_str = cand_cells[4] if len(cand_cells) > 4 else ""
+                cac             = cand_cells[5] if len(cand_cells) > 5 else ""
         cand_action = cand_action_str
 
         if not chance and proxy_cells and len(proxy_cells) > 4:
@@ -855,6 +899,20 @@ def _parse_markdown_tables(text, log_ref=None):
 
     # Clean candidate name
     candidate_name = _re.sub(r"\s*\([A-Z]-\d+\)", "", candidate_name).strip()
+    # Strip "N/A" placeholders
+    if candidate_name.lower() in ("n/a", "na", "unknown", "candidate name", "name"):
+        candidate_name = ""
+
+    # Validate chance — must be numeric
+    if chance:
+        chance_clean = _re.sub(r"[^\d.]", "", chance.strip())
+        try:
+            v = float(chance_clean)
+            chance = str(int(v)) if v == int(v) else chance_clean
+            if v < 0 or v > 100:
+                chance = ""
+        except (ValueError, TypeError):
+            chance = ""
 
     # ── Round Type ─────────────────────────────────────────────────────────
     round_type = ""
@@ -900,6 +958,22 @@ def _parse_markdown_tables(text, log_ref=None):
             duration = dm.group(1).strip().strip("*").strip().rstrip(",")
             if duration:
                 break
+    # Normalize duration format
+    if duration:
+        _dl = duration.strip().lower()
+        _hm = _re.match(r"(\d+)\s*hours?\s*(\d+)\s*min", _dl)
+        if _hm:
+            duration = str(int(_hm.group(1))*60 + int(_hm.group(2))) + " minutes"
+        elif _re.match(r"(\d+)\s*hours?\s*$", _dl):
+            _h = _re.match(r"(\d+)", _dl)
+            duration = str(int(_h.group(1))*60) + " minutes"
+        elif _re.match(r"approx", _dl):
+            _a = _re.search(r"(\d+)", _dl)
+            if _a:
+                duration = _a.group(1) + " minutes"
+        elif _re.match(r"(\d+)\s*mins?\s*$", _dl):
+            _mn = _re.match(r"(\d+)", _dl)
+            duration = _mn.group(1) + " minutes"
 
     total_questions = ""
     for qp in [
@@ -938,6 +1012,13 @@ def _parse_markdown_tables(text, log_ref=None):
                 if val and not _re.match(r"^[\d./]+$", val):
                     round_type = val
                     break
+
+    # ── Validate scores — reject action words accidentally parsed as scores ──
+    _BAD_VALS = {"good","excellent","needs_improvement","needs improvement","critical","na","n/a","ok"}
+    if proxy_score.lower().strip() in _BAD_VALS or not _re.match(r"^[\d.]+/10$", proxy_score):
+        proxy_score = ""
+    if cand_score.lower().strip() in _BAD_VALS or not _re.match(r"^[\d.]+/10$", cand_score):
+        cand_score = ""
 
     # ── Full Final Verdict ──────────────────────────────────────────────────
     verdict = ""
@@ -1097,6 +1178,236 @@ def parse_llm(llm_txt: str) -> dict:
 # LLM SUPPORTING DATA EXTRACTORS
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════════════
+#                    LLM-POWERED PARSER (GPT-4o-mini fallback)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# When the regex parser fails or returns incomplete data (e.g., empty name,
+# missing chance, no scores), we fall back to GPT-4o-mini for structured
+# extraction. Results are cached in S3 keyed by llm.txt content hash so we
+# never pay twice for the same file.
+#
+# Setup: requires OPENAI_API_KEY in env (already set for llm_processor_worker).
+# Cost: ~$0.0001 per parse (4K tokens in, 1K tokens out at gpt-4o-mini pricing).
+
+import hashlib
+try:
+    from openai import OpenAI as _OpenAI
+    _openai_client = None
+    def _get_openai():
+        global _openai_client
+        if _openai_client is None:
+            api_key = os.getenv("OPENAI_API_KEY", "")
+            if not api_key:
+                return None
+            _openai_client = _OpenAI(api_key=api_key)
+        return _openai_client
+except ImportError:
+    _get_openai = lambda: None
+
+
+# JSON schema for structured output — guarantees consistent shape
+LLM_PARSER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "candidate_name":                  {"type": "string"},
+        "chance":                          {"type": "string"},
+        "candidate_action_required":       {"type": "string"},
+        "proxy_support_action_required":   {"type": "string"},
+        "candidate_action_categories":     {"type": "string"},
+        "proxy_support_action_categories": {"type": "string"},
+        "candidate_score":                 {"type": "string"},
+        "proxy_score":                     {"type": "string"},
+        "round_type":                      {"type": "string"},
+        "duration":                        {"type": "string"},
+        "total_questions":                 {"type": "string"},
+        "verdict":                         {"type": "string"},
+        "questions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "question":  {"type": "string"},
+                    "asked_at":  {"type": "string"},
+                    "pasted_at": {"type": "string"},
+                    "delta_sec": {"type": "string"},
+                    "domain":    {"type": "string"},
+                    "speed":     {"type": "string"},
+                },
+                "required": ["question", "asked_at", "pasted_at", "delta_sec", "domain", "speed"],
+                "additionalProperties": False,
+            },
+        },
+        "candidate_evidence": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "category":      {"type": "string"},
+                    "vtt_timestamp": {"type": "string"},
+                    "evidence":      {"type": "string"},
+                },
+                "required": ["category", "vtt_timestamp", "evidence"],
+                "additionalProperties": False,
+            },
+        },
+        "proxy_evidence": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "category":     {"type": "string"},
+                    "doc_versions": {"type": "string"},
+                    "evidence":     {"type": "string"},
+                },
+                "required": ["category", "doc_versions", "evidence"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": [
+        "candidate_name", "chance", "candidate_action_required",
+        "proxy_support_action_required", "candidate_action_categories",
+        "proxy_support_action_categories", "candidate_score", "proxy_score",
+        "round_type", "duration", "total_questions", "verdict",
+        "questions", "candidate_evidence", "proxy_evidence",
+    ],
+    "additionalProperties": False,
+}
+
+
+LLM_EXTRACTOR_PROMPT = """You are a data extraction tool. Extract structured data from this interview analysis report.
+
+The report has TWO performance tables and supporting sections. Extract ALL fields exactly as written, even if formatting varies.
+
+CRITICAL RULES:
+1. candidate_name: from the Candidate Performance Table (NOT the Proxy table). Strip any (I-XXXX) suffix. If unknown/missing, return "".
+2. chance: number 0-100 (no % sign). Return as string. If missing, return "".
+3. candidate_score / proxy_score: format as "N/10" (e.g., "7/10", "5.5/10"). If missing, return "".
+4. duration: normalize to "N minutes" (e.g., "1 hour 6 minutes" → "66 minutes", "Approximately 45" → "45 minutes"). If missing, return "".
+5. round_type: just the type (Introduction_Call, Technical_Discussion, etc). NO numbers/scores. If missing, return "".
+6. candidate_action_required / proxy_support_action_required: GOOD, EXCELLENT, NEEDS_IMPROVEMENT, or CRITICAL. If missing, return "".
+7. categories: comma-separated list, no markdown. If missing, return "".
+8. questions: extract from Response Speed Analysis section. delta_sec as string number (can be negative).
+9. candidate_evidence: from Candidate Flag Details. vtt_timestamp = HH:MM:SS only (no "VTT" or "Timestamp" prefix in the value).
+10. proxy_evidence: from Proxy Flag Details. doc_versions = "Version N" or "Versions N, M". If no version mentioned, return "".
+11. evidence text: clean of markdown, no leading "evidence:" prefix, no surrounding quotes.
+12. If a field cannot be found, return empty string "" (NOT null, NOT "N/A", NOT "Unknown").
+
+Return ONLY valid JSON matching the schema. No markdown, no explanation."""
+
+
+def _llm_cache_key(text: str) -> str:
+    """Hash llm.txt content to use as cache key."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _llm_cache_get(cache_key: str) -> dict:
+    """Try to load cached parse result from S3."""
+    try:
+        s3_path = f"temp/llm-parser-cache/{cache_key}.json"
+        resp = s3.get_object(Bucket=BUCKET, Key=s3_path)
+        return json.loads(resp["Body"].read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _llm_cache_set(cache_key: str, data: dict):
+    """Save parse result to S3 cache."""
+    try:
+        s3_path = f"temp/llm-parser-cache/{cache_key}.json"
+        s3.put_object(
+            Bucket=BUCKET, Key=s3_path,
+            Body=json.dumps(data).encode("utf-8"),
+            ContentType="application/json",
+        )
+    except Exception as e:
+        log.warning(f"LLM cache write failed: {e}")
+
+
+def parse_llm_with_gpt(text: str) -> dict:
+    """
+    Use GPT-4o-mini with structured output to extract all fields from llm.txt.
+    Returns dict matching LLM_PARSER_SCHEMA, or None if API/import failure.
+    Cached by content hash.
+    """
+    client = _get_openai()
+    if client is None:
+        log.warning("OpenAI client unavailable — skipping LLM parse")
+        return None
+
+    # Cache check
+    cache_key = _llm_cache_key(text)
+    cached = _llm_cache_get(cache_key)
+    if cached is not None:
+        log.info(f"  LLM parser cache HIT ({cache_key})")
+        return cached
+
+    # Truncate if needed (GPT-4o-mini has 128K context, but our llm.txt is ~3-6K chars)
+    truncated = text[:50000]
+
+    try:
+        log.info(f"  LLM parser: calling GPT-4o-mini ({len(truncated)} chars)")
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": LLM_EXTRACTOR_PROMPT},
+                {"role": "user",   "content": truncated},
+            ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "interview_parse_result",
+                    "strict": True,
+                    "schema": LLM_PARSER_SCHEMA,
+                },
+            },
+            temperature=0,
+            max_tokens=4096,
+        )
+        raw = response.choices[0].message.content
+        parsed = json.loads(raw)
+        # Cache the result
+        _llm_cache_set(cache_key, parsed)
+        log.info(f"  LLM parser ✅ name={parsed.get('candidate_name','')!r} chance={parsed.get('chance','')!r}")
+        return parsed
+    except Exception as e:
+        log.warning(f"LLM parser error: {e}")
+        return None
+
+
+def parse_llm_smart(text: str) -> tuple:
+    """
+    GPT-4o-mini-only parser: always uses LLM for structured extraction.
+    Cached by content hash so the same llm.txt is never parsed twice.
+    Returns (parsed_dict, questions_list, candidate_evidence_list, proxy_evidence_list).
+    """
+    llm_result = parse_llm_with_gpt(text)
+
+    if llm_result is None:
+        log.error("  LLM parser FAILED \u2014 returning empty result")
+        return _default_result(), [], [], []
+
+    parsed = {
+        "candidate_name":                  llm_result.get("candidate_name", ""),
+        "chance":                          llm_result.get("chance", ""),
+        "candidate_action_required":       llm_result.get("candidate_action_required", ""),
+        "proxy_support_action_required":   llm_result.get("proxy_support_action_required", ""),
+        "candidate_action_categories":     llm_result.get("candidate_action_categories", ""),
+        "proxy_support_action_categories": llm_result.get("proxy_support_action_categories", ""),
+        "candidate_score":                 llm_result.get("candidate_score", ""),
+        "proxy_score":                     llm_result.get("proxy_score", ""),
+        "verdict":                         llm_result.get("verdict", ""),
+        "round_type":                      llm_result.get("round_type", ""),
+        "duration":                        llm_result.get("duration", ""),
+        "total_questions":                 llm_result.get("total_questions", ""),
+    }
+    questions = llm_result.get("questions", [])
+    cand_ev   = llm_result.get("candidate_evidence", [])
+    proxy_ev  = llm_result.get("proxy_evidence", [])
+
+    return parsed, questions, cand_ev, proxy_ev
+
 def _clean_cell(val: str) -> str:
     """Remove markdown bold (**text**), italic (*text*), and leading ~ from cell values."""
     import re as _re
@@ -1168,8 +1479,8 @@ def extract_questions_from_llm(text: str) -> list:
                 # Format B: Q&A pair: "question text", asked_at: ...
                 q_m = re.search(r'Q&A pair[:\s]+"([^"]+)"', s2, re.IGNORECASE)
             if not q_m:
-                # Fallback: first quoted string on the line
-                q_m = re.search(r'"([^"]{10,})"', s2)
+                # Fallback: first quoted string on the line (any length 5+ chars)
+                q_m = re.search(r'"([^"]{5,})"', s2)
 
             if a_m or q_m:
                 rows.append({
@@ -1230,17 +1541,23 @@ def extract_proxy_evidence_from_llm(text: str) -> list:
                 continue
 
             # Format A: - **Category Name**: Version 5, Evidence text
-            m_a = re.match(r"-\s*\*\*([^*]+)\*\*:\s*(.*)", s2)
+            # Format C: - **Category Name:** Version 5 ...   (colon INSIDE bold)
+            m_a = re.match(r"-\s*\*\*([^*]+?):?\*\*:?\s*(.*)", s2)
             # Format B: - Category: Name, triggered by versions N, evidence: text
             m_b = re.match(r"-\s*Category:\s*([^,]+),\s*(.*)", s2, re.IGNORECASE)
 
             if m_a:
+                cat  = m_a.group(1).rstrip(":").strip()
                 rest = m_a.group(2).strip()
-                v_m = re.match(r"(Version[s]?\s*[\d,\s]+),\s*(.*)", rest, re.IGNORECASE)
+                # Try multiple version patterns:
+                # "Version 5, Evidence text"
+                # "Versions 4, 5, 6, Evidence text"  
+                # "Version 2 triggered this flag due to ..."
+                v_m = re.match(r"(Version[s]?\s*[\d,\s]+?)(?:[,]\s*|\s+(?=triggered|due|caused|because))(.*)", rest, re.IGNORECASE)
                 if v_m:
-                    rows.append({"category": _clean_cell(m_a.group(1)), "doc_versions": v_m.group(1).strip(), "evidence": _clean_cell(v_m.group(2).strip())})
+                    rows.append({"category": _clean_cell(cat), "doc_versions": v_m.group(1).strip(), "evidence": _clean_cell(v_m.group(2).strip())})
                 else:
-                    rows.append({"category": _clean_cell(m_a.group(1)), "doc_versions": "", "evidence": _clean_cell(rest)})
+                    rows.append({"category": _clean_cell(cat), "doc_versions": "", "evidence": _clean_cell(rest)})
             elif m_b:
                 rest  = m_b.group(2).strip()
                 ver_m = re.search(r"triggered by (?:versions?\s*)?([^,]+)", rest, re.IGNORECASE)
@@ -1273,11 +1590,17 @@ def extract_candidate_evidence_from_llm(text: str) -> list:
         if header_found and stripped.startswith("|"):
             cells = [_clean_cell(c.strip()) for c in stripped.split("|") if c.strip()]
             if len(cells) >= 3:
-                rows.append({
-                    "category":      cells[0],
-                    "vtt_timestamp": cells[1] if len(cells) > 1 else "",
-                    "evidence":      cells[2] if len(cells) > 2 else "",
-                })
+                cat   = cells[0]
+                ts    = cells[1] if len(cells) > 1 else ""
+                evid  = cells[2] if len(cells) > 2 else ""
+                # Handle case where timestamp is embedded in evidence:
+                # "VTT Timestamp: 00:08:20; notable pause..."
+                if not ts and evid:
+                    ts_m2 = re.match(r"VTT\s*[Tt]imestamp:?\s*([\d:]+)[;,]\s*(.*)", evid, re.IGNORECASE)
+                    if ts_m2:
+                        ts   = ts_m2.group(1).strip()
+                        evid = ts_m2.group(2).strip()
+                rows.append({"category": cat, "vtt_timestamp": ts, "evidence": evid})
         elif in_table and header_found and stripped and stripped.startswith("#"):
             break
 
@@ -1298,17 +1621,28 @@ def extract_candidate_evidence_from_llm(text: str) -> list:
                 continue
 
             # Format A: - **Category Name**: VTT timestamp 00:02:30, evidence text
-            m_a = re.match(r"-\s*\*\*([^*]+)\*\*:\s*(.*)", s2)
+            # Format C: - **Category Name:** Timestamp 00:02:30, evidence text
+            m_a = re.match(r"-\s*\*\*([^*]+?):?\*\*:?\s*(.*)", s2)
             # Format B: - Category: Name, VTT timestamp: HH:MM:SS, evidence quote: "text"
             m_b = re.match(r"-\s*Category:\s*([^,]+),\s*(.*)", s2, re.IGNORECASE)
 
             if m_a:
+                cat  = m_a.group(1).rstrip(":").strip()
                 rest = m_a.group(2).strip()
-                ts_m = re.match(r"(?:VTT\s*timestamp\s*)?([\d:]+),\s*(.*)", rest, re.IGNORECASE)
+                # Try multiple timestamp patterns:
+                # "00:02:15, evidence text"
+                # "VTT timestamp 00:02:15, evidence text"
+                # "Timestamp 00:02:15, evidence text"
+                # "Timestamp: 00:02:15, evidence text"
+                ts_m = re.match(r"(?:VTT\s*timestamp|Timestamp)?:?\s*([\d:]+)[,;]\s*(.*)", rest, re.IGNORECASE)
                 if ts_m:
-                    rows.append({"category": _clean_cell(m_a.group(1)), "vtt_timestamp": _clean_cell(ts_m.group(1).strip()), "evidence": _clean_cell(ts_m.group(2).strip())})
+                    ev = ts_m.group(2).strip()
+                    # Strip "evidence:" / "evidence quote:" prefix
+                    ev = re.sub(r"^(evidence(?:\s*quote)?|quote):\s*\"?", "", ev, flags=re.IGNORECASE)
+                    ev = ev.rstrip('"')
+                    rows.append({"category": _clean_cell(cat), "vtt_timestamp": _clean_cell(ts_m.group(1).strip()), "evidence": _clean_cell(ev)})
                 else:
-                    rows.append({"category": _clean_cell(m_a.group(1)), "vtt_timestamp": "", "evidence": _clean_cell(rest)})
+                    rows.append({"category": _clean_cell(cat), "vtt_timestamp": "", "evidence": _clean_cell(rest)})
             elif m_b:
                 rest  = m_b.group(2).strip()
                 ts_m  = re.search(r"VTT timestamp:\s*([\d:]+)", rest, re.IGNORECASE)
@@ -1900,18 +2234,18 @@ def process(item: dict) -> str:
 
     log.info(f"[{mid}] llm.txt: {len(llm_txt)} chars")
 
-    # ── Step 4: Parse LLM output ──────────────────────────────────────────────
-    parsed = parse_llm(llm_txt)
+    # ── Step 4: Parse LLM output (regex first, GPT-4o-mini fallback) ─────────
+    parsed, q_rows, ce_rows, pe_rows = parse_llm_smart(llm_txt)
     # parsed always has all keys — never None, never {}
 
     log.info(
         f"[{mid}] Parsed → "
-        f"name='{parsed['candidate_name']}' "
-        f"chance='{parsed['chance']}' "
-        f"cand_action={parsed['candidate_action_required']} "
-        f"proxy_action={parsed['proxy_support_action_required']} "
-        f"cac='{parsed['candidate_action_categories'][:50]}' "
-        f"pac='{parsed['proxy_support_action_categories'][:50]}'"
+        f"name='{parsed.get('candidate_name','')}' "
+        f"chance='{parsed.get('chance','')}' "
+        f"cand_action={parsed.get('candidate_action_required','')} "
+        f"proxy_action={parsed.get('proxy_support_action_required','')} "
+        f"cac='{parsed.get('candidate_action_categories','')[:50]}' "
+        f"pac='{parsed.get('proxy_support_action_categories','')[:50]}'"
     )
 
     # ── Step 5: Salesforce ────────────────────────────────────────────────────
@@ -1972,9 +2306,7 @@ def process(item: dict) -> str:
 
     # ── Step 9: Extract evidence & questions from llm.txt ───────────────────
     llm_txt_raw = s3_read(llm_key) if llm_key else ""
-    q_rows    = extract_questions_from_llm(llm_txt_raw)
-    pe_rows   = extract_proxy_evidence_from_llm(llm_txt_raw)
-    ce_rows   = extract_candidate_evidence_from_llm(llm_txt_raw)
+    # q_rows, pe_rows, ce_rows already populated by parse_llm_smart() above
     log.info(f"[{mid}] Evidence: {len(ce_rows)} candidate, {len(pe_rows)} proxy, {len(q_rows)} questions")
 
     # ── Step 10: Create sub-folders for the month ─────────────────────────────
@@ -2053,27 +2385,58 @@ def process(item: dict) -> str:
     total_pastes    = parsed.get("total_pastes", "")
 
     # Data tab uses USER_ENTERED so =HYPERLINK() formulas are clickable
-    _append(ssvc, sid, "Data", [
-        date_str, sf_id, cand_name, is_person, mid, str(chance),
-        cand_action, proxy_action,
-        cac, pac, c_score, p_score, round_type,
-        duration, total_questions,
-        cand_ev_link, prxy_ev_link, quest_link,
-    ], user_entered=True)
+    # Build the data row — protect dates and scores from Sheets auto-conversion
+    # by prefixing with a zero-width space when needed
+    def _safe_text(val):
+        """Prevent Google Sheets from converting strings like '6/10' or '2026-05-01' into dates."""
+        if not val:
+            return ""
+        s = str(val).strip()
+        # If looks like date/score that Sheets would auto-convert, prefix with apostrophe
+        # Use ' (apostrophe) which Sheets treats as text marker (only with RAW)
+        return s
+
+    # Write A-O as RAW (text values preserved exactly)
+    raw_row = [
+        _safe_text(date_str), _safe_text(sf_id), _safe_text(cand_name),
+        _safe_text(is_person), _safe_text(mid), _safe_text(chance),
+        _safe_text(cand_action), _safe_text(proxy_action),
+        _safe_text(cac), _safe_text(pac),
+        _safe_text(c_score), _safe_text(p_score),
+        _safe_text(round_type), _safe_text(duration), _safe_text(total_questions),
+    ]
+    # Write P-R hyperlinks as USER_ENTERED so =HYPERLINK formulas evaluate
+    formula_row = [cand_ev_link, prxy_ev_link, quest_link]
+
+    # Combine into one row, append once with USER_ENTERED
+    # Use leading apostrophe on score values to force text mode
+    full_row = list(raw_row) + list(formula_row)
+    # Force text format on date and score columns by prepending apostrophe
+    # Apostrophe prefix works in USER_ENTERED mode to force text - prevents
+    # Google Sheets from converting "2026-05-07" → datetime, "6/10" → date
+    full_row[0]  = "'" + str(date_str) if date_str else ""  # Date
+    if c_score and "/" in c_score:
+        full_row[10] = "'" + c_score  # Candidate Score
+    if p_score and "/" in p_score:
+        full_row[11] = "'" + p_score  # Proxy Score
+
+    _append(ssvc, sid, "Data", full_row, user_entered=True)
     log.info(f"[{mid}] ✅ Data tab written")
 
     # ── Step 16: Candidate tab ────────────────────────────────────────────────
     if write_c:
         _append(ssvc, sid, "Candidate", [
-            date_str, sf_id, cand_name, mid, str(chance), cand_action, cac,
-        ])
+            "'" + str(date_str) if date_str else "",
+            sf_id, cand_name, mid, str(chance), cand_action, cac,
+        ], user_entered=True)
         log.info(f"[{mid}] ✅ Candidate tab written")
 
     # ── Step 17: Interview-Success tab ────────────────────────────────────────
     if write_i:
         _append(ssvc, sid, "Interview-Success", [
-            date_str, sf_id, is_person, mid, str(chance), proxy_action, pac,
-        ])
+            "'" + str(date_str) if date_str else "",
+            sf_id, is_person, mid, str(chance), proxy_action, pac,
+        ], user_entered=True)
         log.info(f"[{mid}] ✅ Interview-Success tab written")
 
     # ── Step 12: Write sheets-done.json ───────────────────────────────────────
