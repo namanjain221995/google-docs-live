@@ -524,6 +524,9 @@ def _parse_flat_toon(body: str) -> dict | None:
         "proxy_score":                     proxy_score,
         "verdict":                         verdict,
         "round_type":                      round_type,
+        "duration":                        duration,
+        "total_questions":                 total_questions,
+        "total_pastes":                    total_pastes,
     }
 
 
@@ -648,6 +651,11 @@ def _parse_json(body: str) -> dict | None:
     ):
         proxy_action = False
 
+    # Duration from flat toon
+    duration        = _get_field_flat_toon(body, "total_transcript_duration") or                       _get_field_flat_toon(body, "session_duration")
+    total_questions = _get_field_flat_toon(body, "total_questions_asked") or                       _get_field_flat_toon(body, "total_questions")
+    total_pastes    = _get_field_flat_toon(body, "document_versions_count") or                       _get_field_flat_toon(body, "total_pastes")
+
     return {
         "candidate_name":                  candidate_name,
         "chance":                          chance,
@@ -659,6 +667,9 @@ def _parse_json(body: str) -> dict | None:
         "proxy_score":                     proxy_score,
         "verdict":                         verdict,
         "round_type":                      round_type,
+        "duration":                        duration,
+        "total_questions":                 total_questions,
+        "total_pastes":                    total_pastes,
     }
 
 
@@ -675,6 +686,9 @@ def _default_result():
         "proxy_score":                     "",
         "verdict":                         "",
         "round_type":                      "",
+        "duration":                        "",
+        "total_questions":                 "",
+        "total_pastes":                    "",
     }
 
 
@@ -772,6 +786,51 @@ def _parse_markdown_tables(text, log_ref=None):
             if round_type:
                 break
 
+    # ── Duration ──────────────────────────────────────────────────────────────
+    duration = ""
+    for dp in [
+        r'\|\s*(?:Session\s+)?Duration\s*\|\s*([^|\n]+)\|',
+        r'(?:Session\s+)?Duration[^|\n]*[|:]\s*([^|\n*]+)',
+        r'total_transcript_duration[,:\s]+([^\n,]+)',
+    ]:
+        dm = _re.search(dp, text, _re.IGNORECASE)
+        if dm:
+            duration = dm.group(1).strip().strip('*').strip()
+            if duration:
+                break
+
+    # ── Total Questions ───────────────────────────────────────────────────────
+    total_questions = ""
+    for qp in [
+        r'\|\s*Total Questions(?:\s+Asked)?\s*\|\s*([^|\n]+)\|',
+        r'Total Questions[^|\n]*[|:]\s*([^|\n*]+)',
+    ]:
+        qm = _re.search(qp, text, _re.IGNORECASE)
+        if qm:
+            total_questions = qm.group(1).strip().strip('*').strip()
+            # Extract just the number if mixed text like "8 primary questions + 5 follow-ups"
+            num = _re.match(r'(\d+)', total_questions)
+            if num:
+                total_questions = num.group(1)
+            if total_questions:
+                break
+
+    # ── Total Pastes ──────────────────────────────────────────────────────────
+    total_pastes = ""
+    for pp in [
+        r'\|\s*Total(?:\s+Doc)?\s+Pastes\s*\|\s*([^|\n]+)\|',
+        r'Total(?:\s+Doc)?\s+Pastes[^|\n]*[|:]\s*([^|\n*]+)',
+        r'document_versions_count[,:\s]+([^\n,]+)',
+    ]:
+        pm = _re.search(pp, text, _re.IGNORECASE)
+        if pm:
+            total_pastes = pm.group(1).strip().strip('*').strip()
+            num = _re.match(r'(\d+)', total_pastes)
+            if num:
+                total_pastes = num.group(1)
+            if total_pastes:
+                break
+
     # ── Scores (X/10 format) ─────────────────────────────────────────────────
     proxy_score = ""
     cand_score  = ""
@@ -827,6 +886,9 @@ def _parse_markdown_tables(text, log_ref=None):
         "proxy_score":                     proxy_score,
         "verdict":                         verdict,
         "round_type":                      round_type,
+        "duration":                        duration,
+        "total_questions":                 total_questions,
+        "total_pastes":                    total_pastes,
     }
 
 
@@ -939,6 +1001,15 @@ def parse_llm(llm_txt: str) -> dict:
 # LLM SUPPORTING DATA EXTRACTORS
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _clean_cell(val: str) -> str:
+    """Remove markdown bold (**text**), italic (*text*), and leading ~ from cell values."""
+    import re as _re
+    val = _re.sub(r'\*\*([^*]*)\*\*', r'\1', val)  # **bold** → text
+    val = _re.sub(r'\*([^*]*)\*',   r'\1', val)  # *italic* → text
+    val = val.lstrip('~').strip()                     # ~00:15 → 00:15
+    return val.strip()
+
+
 def extract_questions_from_llm(text: str) -> list:
     """
     Extract Response Speed Analysis table from LLM output.
@@ -959,7 +1030,7 @@ def extract_questions_from_llm(text: str) -> list:
             header_found = True
             continue
         if header_found and stripped.startswith("|"):
-            cells = [c.strip() for c in stripped.split("|") if c.strip()]
+            cells = [_clean_cell(c.strip()) for c in stripped.split("|") if c.strip()]
             if len(cells) >= 6:
                 rows.append({
                     "question":   cells[1] if len(cells) > 1 else "",
@@ -994,7 +1065,7 @@ def extract_proxy_evidence_from_llm(text: str) -> list:
             header_found = True
             continue
         if header_found and stripped.startswith("|"):
-            cells = [c.strip() for c in stripped.split("|") if c.strip()]
+            cells = [_clean_cell(c.strip()) for c in stripped.split("|") if c.strip()]
             if len(cells) >= 3:
                 rows.append({
                     "category":     cells[0],
@@ -1026,7 +1097,7 @@ def extract_candidate_evidence_from_llm(text: str) -> list:
             header_found = True
             continue
         if header_found and stripped.startswith("|"):
-            cells = [c.strip() for c in stripped.split("|") if c.strip()]
+            cells = [_clean_cell(c.strip()) for c in stripped.split("|") if c.strip()]
             if len(cells) >= 3:
                 rows.append({
                     "category":      cells[0],
@@ -1187,6 +1258,7 @@ D_HDR = [
     "Candidate Action Required", "Proxy Support Action Required",
     "Candidate Action Categories", "Proxy Support Action Categories",
     "Candidate Score", "Proxy Score", "Verdict", "Round Type",
+    "Duration", "Total Questions", "Total Pastes",
     "Candidate Evidence", "Proxy Evidence", "Questions",
 ]
 
@@ -1402,18 +1474,32 @@ def get_or_create_evidence_sheet(dsvc, ssvc, drive_id, parent_folder_id,
         return sid
 
 
-def append_rows_to_sheet(ssvc, sid: str, rows: list):
-    """Append multiple rows to Sheet1 of a spreadsheet."""
+def append_rows_to_sheet(ssvc, sid: str, rows: list, headers: list = None):
+    """
+    Write rows to Sheet1. CLEARS existing data first to prevent duplicates.
+    Rewrites headers + all rows fresh every time.
+    """
     if not rows:
         return
     _token()
     try:
-        ssvc.spreadsheets().values().append(
+        # Step 1: Clear all existing data (prevents duplicate rows on reprocess)
+        ssvc.spreadsheets().values().clear(
+            spreadsheetId=sid,
+            range="Sheet1!A:Z",
+        ).execute()
+
+        # Step 2: Write headers + data in one batch
+        all_rows = []
+        if headers:
+            all_rows.append(headers)
+        all_rows.extend(rows)
+
+        ssvc.spreadsheets().values().update(
             spreadsheetId=sid,
             range="Sheet1!A1",
             valueInputOption="RAW",
-            insertDataOption="INSERT_ROWS",
-            body={"values": rows},
+            body={"values": all_rows},
         ).execute()
     except Exception as e:
         log.warning(f"append_rows_to_sheet error: {e}")
@@ -1585,7 +1671,7 @@ def process(item: dict) -> str:
         append_rows_to_sheet(ssvc, cand_ev_sid, [
             [r["category"], r["vtt_timestamp"], r["evidence"]]
             for r in ce_rows
-        ])
+        ], headers=CAND_EVIDENCE_HDR)
         log.info(f"[{mid}] ✅ Candidate Evidence sheet written → {cand_ev_sid}")
 
     # ── Step 12: Create/update Proxy Evidence sheet ───────────────────────────
@@ -1598,7 +1684,7 @@ def process(item: dict) -> str:
         append_rows_to_sheet(ssvc, prxy_ev_sid, [
             [r["category"], r["doc_versions"], r["evidence"]]
             for r in pe_rows
-        ])
+        ], headers=PRXY_EVIDENCE_HDR)
         log.info(f"[{mid}] ✅ Proxy Evidence sheet written → {prxy_ev_sid}")
 
     # ── Step 13: Create/update Questions sheet ────────────────────────────────
@@ -1612,7 +1698,7 @@ def process(item: dict) -> str:
             [r["question"], r["asked_at"], r["pasted_at"],
              r["delta_sec"], r["domain"], r["speed"]]
             for r in q_rows
-        ])
+        ], headers=QUESTIONS_HDR)
         log.info(f"[{mid}] ✅ Questions sheet written → {quest_sid}")
 
     # ── Step 14: Build hyperlinks for Data tab ────────────────────────────────
@@ -1621,11 +1707,17 @@ def process(item: dict) -> str:
     quest_link    = make_hyperlink(sheet_url(quest_sid),   "Questions")          if quest_sid   else ""
 
     # ── Step 15: Write Data tab (ALWAYS) ──────────────────────────────────────
+    # Pull new fields from parsed
+    duration        = parsed.get("duration", "")
+    total_questions = parsed.get("total_questions", "")
+    total_pastes    = parsed.get("total_pastes", "")
+
     # Data tab uses USER_ENTERED so =HYPERLINK() formulas are clickable
     _append(ssvc, sid, "Data", [
         date_str, sf_id, cand_name, is_person, mid, str(chance),
         cand_action, proxy_action,
         cac, pac, c_score, p_score, verdict, round_type,
+        duration, total_questions, total_pastes,
         cand_ev_link, prxy_ev_link, quest_link,
     ], user_entered=True)
     log.info(f"[{mid}] ✅ Data tab written")
