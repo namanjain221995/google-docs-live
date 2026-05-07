@@ -934,6 +934,109 @@ def parse_llm(llm_txt: str) -> dict:
     )
     return _default_result()
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LLM SUPPORTING DATA EXTRACTORS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def extract_questions_from_llm(text: str) -> list:
+    """
+    Extract Response Speed Analysis table from LLM output.
+    Returns list of dicts: question, asked_at, pasted_at, delta_sec, domain, speed
+    """
+    rows = []
+    in_table = False
+    header_found = False
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if re.search(r"Response Speed Analysis", stripped, re.IGNORECASE):
+            in_table = True
+            header_found = False
+            continue
+        if not in_table:
+            continue
+        if re.match(r"^\|[-| :]+\|$", stripped):
+            header_found = True
+            continue
+        if header_found and stripped.startswith("|"):
+            cells = [c.strip() for c in stripped.split("|") if c.strip()]
+            if len(cells) >= 6:
+                rows.append({
+                    "question":   cells[1] if len(cells) > 1 else "",
+                    "asked_at":   cells[2] if len(cells) > 2 else "",
+                    "pasted_at":  cells[3] if len(cells) > 3 else "",
+                    "delta_sec":  cells[4] if len(cells) > 4 else "",
+                    "domain":     cells[5] if len(cells) > 5 else "",
+                    "speed":      cells[6] if len(cells) > 6 else "",
+                })
+        elif in_table and header_found and stripped and stripped.startswith("#"):
+            break
+    return rows
+
+
+def extract_proxy_evidence_from_llm(text: str) -> list:
+    """
+    Extract Proxy Flag Details table from LLM output.
+    Returns list of dicts: category, doc_versions, evidence
+    """
+    rows = []
+    in_table = False
+    header_found = False
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if re.search(r"Proxy Flag Details", stripped, re.IGNORECASE):
+            in_table = True
+            header_found = False
+            continue
+        if not in_table:
+            continue
+        if re.match(r"^\|[-| :]+\|$", stripped):
+            header_found = True
+            continue
+        if header_found and stripped.startswith("|"):
+            cells = [c.strip() for c in stripped.split("|") if c.strip()]
+            if len(cells) >= 3:
+                rows.append({
+                    "category":     cells[0],
+                    "doc_versions": cells[1] if len(cells) > 1 else "",
+                    "evidence":     cells[2] if len(cells) > 2 else "",
+                })
+        elif in_table and header_found and stripped and stripped.startswith("#"):
+            break
+    return rows
+
+
+def extract_candidate_evidence_from_llm(text: str) -> list:
+    """
+    Extract Candidate Flag Details table from LLM output.
+    Returns list of dicts: category, vtt_timestamp, evidence
+    """
+    rows = []
+    in_table = False
+    header_found = False
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if re.search(r"Candidate Flag Details", stripped, re.IGNORECASE):
+            in_table = True
+            header_found = False
+            continue
+        if not in_table:
+            continue
+        if re.match(r"^\|[-| :]+\|$", stripped):
+            header_found = True
+            continue
+        if header_found and stripped.startswith("|"):
+            cells = [c.strip() for c in stripped.split("|") if c.strip()]
+            if len(cells) >= 3:
+                rows.append({
+                    "category":      cells[0],
+                    "vtt_timestamp": cells[1] if len(cells) > 1 else "",
+                    "evidence":      cells[2] if len(cells) > 2 else "",
+                })
+        elif in_table and header_found and stripped and stripped.startswith("#"):
+            break
+    return rows
+
 # ── Path helpers ──────────────────────────────────────────────────────────────
 def _clean(s):
     return s.replace("_", " ").strip()
@@ -1084,6 +1187,7 @@ D_HDR = [
     "Candidate Action Required", "Proxy Support Action Required",
     "Candidate Action Categories", "Proxy Support Action Categories",
     "Candidate Score", "Proxy Score", "Verdict", "Round Type",
+    "Candidate Evidence", "Proxy Evidence", "Questions",
 ]
 
 def _setup_tabs(ssvc, sid):
@@ -1222,6 +1326,103 @@ def _append(ssvc, sid, tab, row):
                 log.error(f"Sheets error tab='{tab}': {e}")
                 raise
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EVIDENCE & QUESTION SHEET HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Headers
+CAND_EVIDENCE_HDR = ["Candidate Action Category", "VTT Timestamp", "Evidence"]
+PRXY_EVIDENCE_HDR = ["Proxy Action Category",     "Doc Versions",  "Evidence"]
+QUESTIONS_HDR     = ["Question", "Asked At", "Pasted At", "Delta Seconds", "Domain Type", "Speed Rating"]
+
+
+def _safe_sheet_name(name: str) -> str:
+    """Make a safe Google Sheets tab/file name (max 100 chars, no special chars)."""
+    safe = re.sub(r'[/\\\[\]\*\?\:]', " ", name).strip()
+    return safe[:100] if safe else "Unknown"
+
+
+def get_or_create_evidence_sheet(dsvc, ssvc, drive_id, parent_folder_id,
+                                  sheet_name: str, headers: list) -> str:
+    """
+    Get or create a spreadsheet with given name in parent_folder_id.
+    Sets up header row if new. Returns spreadsheet_id.
+    """
+    safe_name = _safe_sheet_name(sheet_name)
+    k = f"ev:{parent_folder_id}:{safe_name}"
+    with _dc_lk:
+        if k in _dc:
+            return _dc[k]
+
+    with _lk(k):
+        with _dc_lk:
+            if k in _dc:
+                return _dc[k]
+
+        # Check if sheet already exists
+        resp = dsvc.files().list(
+            q=(f"name='{safe_name}' and "
+               f"mimeType='application/vnd.google-apps.spreadsheet' "
+               f"and '{parent_folder_id}' in parents and trashed=false"),
+            spaces="drive", fields="files(id,name)",
+            includeItemsFromAllDrives=True, supportsAllDrives=True,
+            corpora="drive", driveId=drive_id,
+        ).execute()
+        files = resp.get("files", [])
+        if files:
+            sid = files[0]["id"]
+        else:
+            sid = dsvc.files().create(
+                body={
+                    "name":    safe_name,
+                    "mimeType": "application/vnd.google-apps.spreadsheet",
+                    "parents": [parent_folder_id],
+                },
+                fields="id",
+                supportsAllDrives=True,
+            ).execute()["id"]
+            # Set up header
+            ssvc.spreadsheets().values().update(
+                spreadsheetId=sid,
+                range="Sheet1!A1",
+                valueInputOption="RAW",
+                body={"values": [headers]},
+            ).execute()
+            log.info(f"✅ Created evidence sheet '{safe_name}' → {sid}")
+
+        with _dc_lk:
+            _dc[k] = sid
+        return sid
+
+
+def append_rows_to_sheet(ssvc, sid: str, rows: list):
+    """Append multiple rows to Sheet1 of a spreadsheet."""
+    if not rows:
+        return
+    _token()
+    try:
+        ssvc.spreadsheets().values().append(
+            spreadsheetId=sid,
+            range="Sheet1!A1",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": rows},
+        ).execute()
+    except Exception as e:
+        log.warning(f"append_rows_to_sheet error: {e}")
+
+
+def make_hyperlink(url: str, label: str) -> str:
+    """Create a Google Sheets HYPERLINK formula."""
+    label_safe = label.replace('"', '\"'  )
+    return f'=HYPERLINK("{url}","{label_safe}")'
+
+
+def sheet_url(spreadsheet_id: str, gid: str = "0") -> str:
+    """Build Google Sheets URL from spreadsheet_id."""
+    return f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
+
 # ══════════════════════════════════════════════════════════════════════════════
 # CORE PROCESSOR
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1356,22 +1557,80 @@ def process(item: dict) -> str:
     write_i = True
     routing_reason = "always_write_both"
 
-    # ── Step 9: Write Data tab (ALWAYS) ───────────────────────────────────────
+    # ── Step 9: Extract evidence & questions from llm.txt ───────────────────
+    llm_txt_raw = s3_read(llm_key) if llm_key else ""
+    q_rows    = extract_questions_from_llm(llm_txt_raw)
+    pe_rows   = extract_proxy_evidence_from_llm(llm_txt_raw)
+    ce_rows   = extract_candidate_evidence_from_llm(llm_txt_raw)
+    log.info(f"[{mid}] Evidence: {len(ce_rows)} candidate, {len(pe_rows)} proxy, {len(q_rows)} questions")
+
+    # ── Step 10: Create sub-folders for the month ─────────────────────────────
+    cand_ev_folder = _folder(dsvc, "Candidate Evidence",       mf, did)
+    prxy_ev_folder = _folder(dsvc, "Interview-Success Evidence", mf, did)
+    quest_folder   = _folder(dsvc, "Questions",                mf, did)
+
+    # ── Step 11: Create/update Candidate Evidence sheet ───────────────────────
+    cand_ev_sid = ""
+    if ce_rows:
+        cand_ev_sid = get_or_create_evidence_sheet(
+            dsvc, ssvc, did, cand_ev_folder,
+            cand_name or mid, CAND_EVIDENCE_HDR,
+        )
+        append_rows_to_sheet(ssvc, cand_ev_sid, [
+            [r["category"], r["vtt_timestamp"], r["evidence"]]
+            for r in ce_rows
+        ])
+        log.info(f"[{mid}] ✅ Candidate Evidence sheet written → {cand_ev_sid}")
+
+    # ── Step 12: Create/update Proxy Evidence sheet ───────────────────────────
+    prxy_ev_sid = ""
+    if pe_rows:
+        prxy_ev_sid = get_or_create_evidence_sheet(
+            dsvc, ssvc, did, prxy_ev_folder,
+            is_person or mid, PRXY_EVIDENCE_HDR,
+        )
+        append_rows_to_sheet(ssvc, prxy_ev_sid, [
+            [r["category"], r["doc_versions"], r["evidence"]]
+            for r in pe_rows
+        ])
+        log.info(f"[{mid}] ✅ Proxy Evidence sheet written → {prxy_ev_sid}")
+
+    # ── Step 13: Create/update Questions sheet ────────────────────────────────
+    quest_sid = ""
+    if q_rows:
+        quest_sid = get_or_create_evidence_sheet(
+            dsvc, ssvc, did, quest_folder,
+            mid, QUESTIONS_HDR,
+        )
+        append_rows_to_sheet(ssvc, quest_sid, [
+            [r["question"], r["asked_at"], r["pasted_at"],
+             r["delta_sec"], r["domain"], r["speed"]]
+            for r in q_rows
+        ])
+        log.info(f"[{mid}] ✅ Questions sheet written → {quest_sid}")
+
+    # ── Step 14: Build hyperlinks for Data tab ────────────────────────────────
+    cand_ev_link  = make_hyperlink(sheet_url(cand_ev_sid), "Candidate Evidence") if cand_ev_sid else ""
+    prxy_ev_link  = make_hyperlink(sheet_url(prxy_ev_sid), "Proxy Evidence")     if prxy_ev_sid else ""
+    quest_link    = make_hyperlink(sheet_url(quest_sid),   "Questions")          if quest_sid   else ""
+
+    # ── Step 15: Write Data tab (ALWAYS) ──────────────────────────────────────
     _append(ssvc, sid, "Data", [
         date_str, sf_id, cand_name, is_person, mid, str(chance),
         cand_action, proxy_action,
         cac, pac, c_score, p_score, verdict, round_type,
+        cand_ev_link, prxy_ev_link, quest_link,
     ])
     log.info(f"[{mid}] ✅ Data tab written")
 
-    # ── Step 10: Candidate tab ────────────────────────────────────────────────
+    # ── Step 16: Candidate tab ────────────────────────────────────────────────
     if write_c:
         _append(ssvc, sid, "Candidate", [
             date_str, sf_id, cand_name, mid, str(chance), cand_action, cac,
         ])
         log.info(f"[{mid}] ✅ Candidate tab written")
 
-    # ── Step 11: Interview-Success tab ────────────────────────────────────────
+    # ── Step 17: Interview-Success tab ────────────────────────────────────────
     if write_i:
         _append(ssvc, sid, "Interview-Success", [
             date_str, sf_id, is_person, mid, str(chance), proxy_action, pac,
@@ -1390,9 +1649,17 @@ def process(item: dict) -> str:
         "llm_key":          llm_key,
         "base_prefix":      bp,
         "tabs_written": {
-            "Data":               True,
-            "Candidate":          write_c,
-            "Interview-Success":  write_i,
+            "Data":                    True,
+            "Candidate":               write_c,
+            "Interview-Success":       write_i,
+            "Candidate Evidence":      bool(cand_ev_sid),
+            "Proxy Evidence":          bool(prxy_ev_sid),
+            "Questions":               bool(quest_sid),
+        },
+        "evidence_sheets": {
+            "candidate_evidence_id":   cand_ev_sid,
+            "proxy_evidence_id":       prxy_ev_sid,
+            "questions_id":            quest_sid,
         },
         "routing_reason":   routing_reason,
         "sf_interview_id":  sf_id,
