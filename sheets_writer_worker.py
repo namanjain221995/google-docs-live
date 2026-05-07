@@ -1301,14 +1301,20 @@ def _share_sheet_with_team(dsvc, sid: str):
 
 
 # ── Append row with retry ─────────────────────────────────────────────────────
-def _append(ssvc, sid, tab, row):
+def _append(ssvc, sid, tab, row, user_entered=False):
+    """
+    Append a row to a sheet tab.
+    user_entered=True: use USER_ENTERED so =HYPERLINK() formulas are evaluated.
+    user_entered=False: use RAW for plain data (faster, no formula parsing).
+    """
+    input_option = "USER_ENTERED" if user_entered else "RAW"
     for attempt in range(6):
         _token()
         try:
             ssvc.spreadsheets().values().append(
                 spreadsheetId=sid,
                 range=f"'{tab}'!A1",
-                valueInputOption="RAW",
+                valueInputOption=input_option,
                 insertDataOption="INSERT_ROWS",
                 body={"values": [row]},
             ).execute()
@@ -1615,12 +1621,13 @@ def process(item: dict) -> str:
     quest_link    = make_hyperlink(sheet_url(quest_sid),   "Questions")          if quest_sid   else ""
 
     # ── Step 15: Write Data tab (ALWAYS) ──────────────────────────────────────
+    # Data tab uses USER_ENTERED so =HYPERLINK() formulas are clickable
     _append(ssvc, sid, "Data", [
         date_str, sf_id, cand_name, is_person, mid, str(chance),
         cand_action, proxy_action,
         cac, pac, c_score, p_score, verdict, round_type,
         cand_ev_link, prxy_ev_link, quest_link,
-    ])
+    ], user_entered=True)
     log.info(f"[{mid}] ✅ Data tab written")
 
     # ── Step 16: Candidate tab ────────────────────────────────────────────────
