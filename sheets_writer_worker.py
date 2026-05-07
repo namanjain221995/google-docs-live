@@ -491,11 +491,11 @@ def _parse_flat_toon(body: str) -> dict | None:
     cac = _extract_categories_flat_toon(body, "candidate_action_categories")
     pac = _extract_categories_flat_toon(body, "proxy_support_action_categories")
 
-    # ── scores ────────────────────────────────────────────────────────────────
+    # ── scores (X/10 format) ──────────────────────────────────────────────────
     # First score = candidate, second = proxy
-    scores      = re.findall(r'^\s*score\s*,\s*(\d+)', body, re.MULTILINE)
-    cand_score  = scores[0] if len(scores) > 0 else ""
-    proxy_score = scores[1] if len(scores) > 1 else ""
+    scores      = re.findall(r'^\s*score\s*,\s*([\d.]+)', body, re.MULTILINE)
+    cand_score  = (scores[0] + "/10") if len(scores) > 0 else ""
+    proxy_score = (scores[1] + "/10") if len(scores) > 1 else ""
 
     # ── verdict ───────────────────────────────────────────────────────────────
     verdict = (
@@ -679,17 +679,29 @@ def _default_result():
 
 
 def _parse_markdown_tables(text, log_ref=None):
+    """
+    Parse NEW prompt v3.0 output — Markdown tables + Session Overview + Final Verdict.
+
+    Extracts from TABLE 1 (Proxy) and TABLE 2 (Candidate):
+      - candidate_name, chance, action_required, categories
+
+    Also extracts from supporting sections:
+      - proxy_score, candidate_score (X/10 format)
+      - round_type (from Session Overview or audit_metadata)
+      - verdict (full Final Verdict text with all rationale points)
+    """
     import re as _re
+
     NO_ACTION_WORDS = ("no action needed", "none", "n/a", "no issues", "not applicable")
 
     def get_last_table_row(txt, keyword):
+        """Find last table matching keyword, return first data row as cell list."""
         results = []
         lines = txt.split("\n")
         i = 0
         while i < len(lines):
             line = lines[i]
             if _re.search(r'TABLE.*' + _re.escape(keyword), line, _re.IGNORECASE):
-                # Find: header row → separator row → data row
                 j = i + 1
                 found_sep = False
                 while j < len(lines) and j < i + 10:
@@ -697,12 +709,10 @@ def _parse_markdown_tables(text, log_ref=None):
                     if not l2:
                         j += 1
                         continue
-                    # Separator row: |---|---|
                     if _re.match(r'^\|[-| :]+\|$', l2):
                         found_sep = True
                         j += 1
                         continue
-                    # After separator: first pipe row = data row
                     if found_sep and l2.startswith("|"):
                         cells = [c.strip() for c in l2.split("|") if c.strip()]
                         if len(cells) >= 4:
@@ -721,12 +731,14 @@ def _parse_markdown_tables(text, log_ref=None):
     if not proxy_cells and not cand_cells:
         return None
 
-    pac = ""
+    # ── Proxy table: Date|SF_ID|IS_Person|MeetingID|Chance|Action|Categories ──
+    pac              = ""
     proxy_action_str = ""
     if proxy_cells:
         proxy_action_str = proxy_cells[5] if len(proxy_cells) > 5 else ""
         pac              = proxy_cells[6] if len(proxy_cells) > 6 else ""
 
+    # ── Candidate table: SF_ID|Name|MeetingID|Chance|Action|Categories ─────────
     candidate_name  = ""
     chance          = ""
     cand_action_str = ""
@@ -740,28 +752,66 @@ def _parse_markdown_tables(text, log_ref=None):
     if not chance and proxy_cells and len(proxy_cells) > 4:
         chance = proxy_cells[4]
 
-    def action_to_bool(action_str, cats):
-        a = action_str.lower().strip()
-        if a in ("good", "excellent"):
-            return False
-        if a in ("needs_improvement", "critical", "needs improvement"):
-            return True
-        if cats:
-            cat_list = [c.strip().lower() for c in cats.split(",") if c.strip()]
-            if cat_list and all(any(p in c for p in NO_ACTION_WORDS) for c in cat_list):
-                return False
-        return bool(cats and cats.strip())
-
-    # Use raw action strings directly from LLM output
+    # ── Raw action strings (no bool conversion) ──────────────────────────────
     cand_action  = cand_action_str
     proxy_action = proxy_action_str
 
+    # ── Clean candidate name ─────────────────────────────────────────────────
     candidate_name = _re.sub(r'\s*\([A-Z]-\d+\)', '', candidate_name).strip()
 
+    # ── Round Type ────────────────────────────────────────────────────────────
     round_type = ""
-    m = _re.search(r'Round Type[^|]*\|[^|]*\|\s*\**([^\n|*]+)', text, _re.IGNORECASE)
-    if m:
-        round_type = m.group(1).strip()
+    for rtp in [
+        r'\|\s*Round Type\s*\|\s*([^|\n]+)\|',
+        r'round_type_detected[,:\s]+([^\n,]+)',
+        r'Round Type[^|\n]*[|:]\s*([^|\n*]+)',
+    ]:
+        rm = _re.search(rtp, text, _re.IGNORECASE)
+        if rm:
+            round_type = rm.group(1).strip().strip('*').strip()
+            if round_type:
+                break
+
+    # ── Scores (X/10 format) ─────────────────────────────────────────────────
+    proxy_score = ""
+    cand_score  = ""
+    for field, is_proxy in [("Proxy Score", True), ("Candidate Score", False)]:
+        for sp in [
+            r'\|\s*' + _re.escape(field) + r'\s*\|\s*([\d.]+)\s*/\s*10\s*\|',
+            _re.escape(field) + r'[^\n]*?([\d.]+)\s*/\s*10',
+        ]:
+            sm = _re.search(sp, text, _re.IGNORECASE)
+            if sm:
+                val = sm.group(1).strip() + "/10"
+                if is_proxy:
+                    proxy_score = val
+                else:
+                    cand_score = val
+                break
+
+    # ── Full Final Verdict ────────────────────────────────────────────────────
+    verdict = ""
+    for vp in [
+        r'##\s+Final Verdict\s*\n(.*?)(?=\n##|\Z)',
+        r'##\s+FINAL[_\s]VERDICT\s*\n(.*?)(?=\n##|\Z)',
+        r'final_verdict,\s*\n(.*?)(?=\n\w|\Z)',
+    ]:
+        vm = _re.search(vp, text, _re.IGNORECASE | _re.DOTALL)
+        if vm:
+            v = vm.group(1).strip()
+            # Clean markdown formatting
+            v = _re.sub(r'\*\*([^*]+)\*\*', r'\1', v)
+            v = _re.sub(r'#{1,4}\s+', '', v)
+            v = _re.sub(r'\n{3,}', '\n\n', v)
+            # Stop at next major section
+            for stop in ["## Insufficient", "## Mistake", "### Predicted",
+                         "insufficient_context", "## END OF"]:
+                idx2 = v.find(stop)
+                if idx2 > 0:
+                    v = v[:idx2].strip()
+            verdict = v.strip()
+            if verdict:
+                break
 
     if not candidate_name and not chance:
         return None
@@ -773,9 +823,9 @@ def _parse_markdown_tables(text, log_ref=None):
         "proxy_support_action_required":   proxy_action,
         "candidate_action_categories":     cac,
         "proxy_support_action_categories": pac,
-        "candidate_score":                 "",
-        "proxy_score":                     "",
-        "verdict":                         "",
+        "candidate_score":                 cand_score,
+        "proxy_score":                     proxy_score,
+        "verdict":                         verdict,
         "round_type":                      round_type,
     }
 
