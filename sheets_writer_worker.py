@@ -45,7 +45,7 @@ SHARED_DRIVE_NAME = "2026_Shared_Drive"
 GDRIVE_FOLDER     = "Interview Success"
 DEPARTMENTS       = ["Interview-Success", "Training", "Customer-Success", "Marketing"]
 LIVE_WORKERS      = 10
-BACKFILL_WORKERS  = 10
+BACKFILL_WORKERS  = 5   # Reduced to avoid Sheets 429 rate limit
 
 # ONLY these 3 people should have access — all others will be removed
 SHARE_WITH_EMAILS = [
@@ -1734,13 +1734,22 @@ def get_or_create_evidence_sheet(dsvc, ssvc, drive_id, parent_folder_id,
                 fields="id",
                 supportsAllDrives=True,
             ).execute()["id"]
-            # Set up header
-            ssvc.spreadsheets().values().update(
-                spreadsheetId=sid,
-                range="Sheet1!A1",
-                valueInputOption="RAW",
-                body={"values": [headers]},
-            ).execute()
+            # Set up header with retry
+            for attempt in range(4):
+                try:
+                    time.sleep(0.3 * (attempt + 1))
+                    ssvc.spreadsheets().values().update(
+                        spreadsheetId=sid,
+                        range="Sheet1!A1",
+                        valueInputOption="RAW",
+                        body={"values": [headers]},
+                    ).execute()
+                    break
+                except HttpError as e:
+                    if e.resp.status == 429 and attempt < 3:
+                        time.sleep((2 ** attempt) * 5)
+                    else:
+                        raise
             log.info(f"✅ Created evidence sheet '{safe_name}' → {sid}")
 
         with _dc_lk:
@@ -1752,31 +1761,45 @@ def append_rows_to_sheet(ssvc, sid: str, rows: list, headers: list = None):
     """
     Write rows to Sheet1. CLEARS existing data first to prevent duplicates.
     Rewrites headers + all rows fresh every time.
+    Retries on 429 rate limit with exponential backoff.
     """
     if not rows:
         return
-    _token()
-    try:
-        # Step 1: Clear all existing data (prevents duplicate rows on reprocess)
-        ssvc.spreadsheets().values().clear(
-            spreadsheetId=sid,
-            range="Sheet1!A:Z",
-        ).execute()
+    all_rows = []
+    if headers:
+        all_rows.append(headers)
+    all_rows.extend(rows)
 
-        # Step 2: Write headers + data in one batch
-        all_rows = []
-        if headers:
-            all_rows.append(headers)
-        all_rows.extend(rows)
-
-        ssvc.spreadsheets().values().update(
-            spreadsheetId=sid,
-            range="Sheet1!A1",
-            valueInputOption="RAW",
-            body={"values": all_rows},
-        ).execute()
-    except Exception as e:
-        log.warning(f"append_rows_to_sheet error: {e}")
+    for attempt in range(6):
+        _token()
+        try:
+            # Step 1: Clear existing data
+            ssvc.spreadsheets().values().clear(
+                spreadsheetId=sid,
+                range="Sheet1!A:Z",
+            ).execute()
+            time.sleep(0.5)  # Small pause between clear and write
+            # Step 2: Write headers + data
+            ssvc.spreadsheets().values().update(
+                spreadsheetId=sid,
+                range="Sheet1!A1",
+                valueInputOption="RAW",
+                body={"values": all_rows},
+            ).execute()
+            return
+        except HttpError as e:
+            if e.resp.status == 429:
+                wait = (2 ** attempt) * 5
+                log.warning(f"429 evidence sheet {sid} attempt {attempt+1}/6 sleep {wait}s")
+                time.sleep(wait)
+                if attempt == 5:
+                    raise
+            else:
+                log.warning(f"append_rows_to_sheet error: {e}")
+                raise
+        except Exception as e:
+            log.warning(f"append_rows_to_sheet error: {e}")
+            raise
 
 
 def make_hyperlink(url: str, label: str) -> str:
@@ -1950,6 +1973,7 @@ def process(item: dict) -> str:
             for r in ce_rows
         ], headers=CAND_EVIDENCE_HDR)
         log.info(f"[{mid}] ✅ Candidate Evidence sheet written → {cand_ev_sid}")
+        time.sleep(1)  # Pause between sheet writes to avoid 429
 
     # ── Step 12: Create/update Proxy Evidence sheet ───────────────────────────
     prxy_ev_sid = ""
@@ -1963,6 +1987,7 @@ def process(item: dict) -> str:
             for r in pe_rows
         ], headers=PRXY_EVIDENCE_HDR)
         log.info(f"[{mid}] ✅ Proxy Evidence sheet written → {prxy_ev_sid}")
+        time.sleep(1)
 
     # ── Step 13: Create/update Questions sheet ────────────────────────────────
     quest_sid = ""
