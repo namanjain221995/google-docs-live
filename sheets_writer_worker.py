@@ -1201,25 +1201,47 @@ except ImportError as _e:
 
 _openai_client = None
 def _get_openai():
-    """Get cached OpenAI client. Logs why it fails on first call."""
+    """
+    Get cached OpenAI client. Tries env var first, then AWS Secrets Manager.
+    Logs why it fails on first call.
+    """
     global _openai_client
     if not _OPENAI_IMPORT_OK:
         return None
-    if _openai_client is None:
-        api_key = os.getenv("OPENAI_API_KEY", "").strip()
-        if not api_key:
-            log.error("OPENAI_API_KEY env var not set! Add it to /home/ec2-user/google-docs-live/env")
-            return None
-        if not api_key.startswith("sk-"):
-            log.error(f"OPENAI_API_KEY looks invalid (starts with {api_key[:5]!r})")
-            return None
+    if _openai_client is not None:
+        return _openai_client
+
+    # Try env var first
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    source  = "env"
+
+    # Fallback: AWS Secrets Manager (where llm_processor_worker stores it)
+    if not api_key:
         try:
-            _openai_client = _OpenAI(api_key=api_key)
-            log.info(f"OpenAI client initialized (key {api_key[:8]}...{api_key[-4:]})")
+            sec = get_secret(API_SECRET_NAME)
+            # Try common key names in the secret
+            for key_name in ("OPENAI_API_KEY", "openai_api_key", "openai-api-key", "OPENAI_KEY"):
+                if key_name in sec and sec[key_name]:
+                    api_key = str(sec[key_name]).strip()
+                    source  = f"secrets-manager:{key_name}"
+                    break
         except Exception as e:
-            log.error(f"Failed to create OpenAI client: {e}")
-            return None
-    return _openai_client
+            log.error(f"Could not read OpenAI key from Secrets Manager: {e}")
+
+    if not api_key:
+        log.error("OPENAI_API_KEY not found in env OR Secrets Manager (secrets/api)")
+        log.error("  Expected: secret \"secrets/api\" with key \"OPENAI_API_KEY\"")
+        return None
+    if not api_key.startswith("sk-"):
+        log.error(f"OpenAI key looks invalid (starts with {api_key[:5]!r}, source={source})")
+        return None
+    try:
+        _openai_client = _OpenAI(api_key=api_key)
+        log.info(f"OpenAI client initialized (key {api_key[:8]}...{api_key[-4:]}, source={source})")
+        return _openai_client
+    except Exception as e:
+        log.error(f"Failed to create OpenAI client: {e}")
+        return None
 
 
 # JSON schema for structured output — guarantees consistent shape
