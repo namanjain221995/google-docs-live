@@ -1363,29 +1363,406 @@ def _llm_cache_set(cache_key: str, data: dict):
         log.warning(f"LLM cache write failed: {e}")
 
 
+
+def parse_strict_v31(text: str) -> dict:
+    """
+    Parse the strict v3.1 output format from prompt.txt v3.1.
+
+    Expected layout:
+      ### Table 1: Proxy Support Performance Table
+      | Date | SF ID | IS Person | Meeting ID | Chance | Action | Proxy Categories |
+      |------|...|
+      | 2026-05-08 | I-... | ... |
+
+      ### Table 2: Candidate Performance Table
+      | SF ID | Candidate Name | Meeting ID | Chance | Action | Candidate Categories |
+      |------|...|
+      | I-... | Sohan Patil | ... |
+
+      #### Response Speed Analysis
+      - Q: <text> | asked_at: HH:MM:SS | pasted_at: HH:MM:SS | delta: N seconds | domain: <d> | rating: OK|WARNING|SLOW
+
+      #### Proxy Flag Details
+      - <Category Name>: triggered by Version N | evidence: <text>
+
+      #### Candidate Flag Details
+      - <Category Name>: VTT timestamp HH:MM:SS | evidence: <text>
+
+      #### Interviewer Engagement Summary
+      Engagement level: ENGAGED. <text>
+
+      #### Session Overview
+      - Round Type: X
+      - Duration: N minutes
+      - Total Questions: N
+      - Total Pastes: N
+      - Proxy Score: X.X/10
+      - Candidate Score: X.X/10
+
+    Returns dict matching internal schema, OR None if format doesn't match.
+    """
+    if not text:
+        return None
+
+    # Quick reject: must have both table headers
+    if "### Table 1" not in text and "### Table1" not in text:
+        return None
+
+    result = {
+        "candidate_name":                  "",
+        "chance":                          "",
+        "candidate_action_required":       "",
+        "proxy_support_action_required":   "",
+        "candidate_action_categories":     "",
+        "proxy_support_action_categories": "",
+        "candidate_score":                 "",
+        "proxy_score":                     "",
+        "verdict":                         "",
+        "round_type":                      "",
+        "duration":                        "",
+        "total_questions":                 "",
+    }
+    questions    = []
+    cand_evidence = []
+    proxy_evidence = []
+
+    # ── Parse Table 1 (Proxy Performance) ─────────────────────────────────────
+    t1_match = _re.search(
+        r"###\s*Table\s*1[:\.]?[^\n]*\n+\|([^\n]+)\|\n\|[\s\-:|]+\|\n\|([^\n]+)\|",
+        text, _re.IGNORECASE,
+    )
+    if t1_match:
+        headers = [c.strip() for c in t1_match.group(1).split("|") if c.strip()]
+        values  = [c.strip() for c in t1_match.group(2).split("|") if c.strip()]
+        t1 = dict(zip([h.lower() for h in headers], values))
+
+        # Map fields (be flexible on key matching)
+        for k, v in t1.items():
+            kl = k.lower()
+            if "chance" in kl and not result["chance"]:
+                # extract integer from value
+                m = _re.search(r"(\d{1,3})", v)
+                if m:
+                    n = int(m.group(1))
+                    if 0 <= n <= 100:
+                        result["chance"] = str(n)
+            elif "action required" in kl or kl == "action":
+                if not result["proxy_support_action_required"]:
+                    result["proxy_support_action_required"] = v.strip().upper().replace(" ", "_")
+            elif "proxy support action categor" in kl or "proxy categor" in kl:
+                result["proxy_support_action_categories"] = v.strip()
+
+    # ── Parse Table 2 (Candidate Performance) ─────────────────────────────────
+    t2_match = _re.search(
+        r"###\s*Table\s*2[:\.]?[^\n]*\n+\|([^\n]+)\|\n\|[\s\-:|]+\|\n\|([^\n]+)\|",
+        text, _re.IGNORECASE,
+    )
+    if t2_match:
+        headers = [c.strip() for c in t2_match.group(1).split("|") if c.strip()]
+        values  = [c.strip() for c in t2_match.group(2).split("|") if c.strip()]
+        t2 = dict(zip([h.lower() for h in headers], values))
+
+        for k, v in t2.items():
+            kl = k.lower()
+            if "candidate name" in kl or kl == "name":
+                # Strip any markdown stars
+                cn = v.replace("**", "").strip()
+                # Reject placeholder values
+                if cn.lower() not in ("not_found", "unknown", "n/a", "na", ""):
+                    result["candidate_name"] = cn
+            elif "chance" in kl and not result["chance"]:
+                m = _re.search(r"(\d{1,3})", v)
+                if m:
+                    n = int(m.group(1))
+                    if 0 <= n <= 100:
+                        result["chance"] = str(n)
+            elif "action required" in kl or kl == "action":
+                if not result["candidate_action_required"]:
+                    result["candidate_action_required"] = v.strip().upper().replace(" ", "_")
+            elif "candidate action categor" in kl or "candidate categor" in kl:
+                result["candidate_action_categories"] = v.strip()
+
+    # ── Parse Session Overview bullets ────────────────────────────────────────
+    so_match = _re.search(
+        r"####\s*Session\s*Overview[^\n]*\n+(.*?)(?=\n####|\Z)",
+        text, _re.IGNORECASE | _re.DOTALL,
+    )
+    if so_match:
+        so_block = so_match.group(1)
+        # Each bullet: - <Field>: <Value>
+        for line in so_block.splitlines():
+            line = line.strip()
+            if not line.startswith("-"):
+                continue
+            line = line.lstrip("-").strip()
+            if ":" not in line:
+                continue
+            field, _, value = line.partition(":")
+            field = field.strip().lower()
+            value = value.strip()
+            if "round type" in field or field == "round":
+                result["round_type"] = value.replace("**", "").strip()
+            elif "duration" in field:
+                # Normalize "1 hour 6 minutes" → "66 minutes"
+                vd = value.lower().strip()
+                hm = _re.match(r"(\d+)\s*hours?\s*(\d+)\s*min", vd)
+                if hm:
+                    result["duration"] = str(int(hm.group(1))*60 + int(hm.group(2))) + " minutes"
+                elif _re.match(r"(\d+)\s*hours?\s*$", vd):
+                    h = _re.match(r"(\d+)", vd)
+                    result["duration"] = str(int(h.group(1))*60) + " minutes"
+                elif _re.match(r"approx", vd):
+                    a = _re.search(r"(\d+)", vd)
+                    if a:
+                        result["duration"] = a.group(1) + " minutes"
+                elif _re.match(r"(\d+)\s*mins?\s*$", vd):
+                    mn = _re.match(r"(\d+)", vd)
+                    result["duration"] = mn.group(1) + " minutes"
+                else:
+                    result["duration"] = value
+            elif "total questions" in field:
+                m = _re.search(r"(\d+)", value)
+                if m:
+                    result["total_questions"] = m.group(1)
+            elif "proxy score" in field:
+                m = _re.search(r"([\d.]+)\s*/\s*10", value)
+                if m:
+                    result["proxy_score"] = m.group(1) + "/10"
+            elif "candidate score" in field:
+                m = _re.search(r"([\d.]+)\s*/\s*10", value)
+                if m:
+                    result["candidate_score"] = m.group(1) + "/10"
+
+    # ── Parse Response Speed Analysis bullets ─────────────────────────────────
+    rsa_match = _re.search(
+        r"####\s*Response\s*Speed\s*Analysis[^\n]*\n+(.*?)(?=\n####|\Z)",
+        text, _re.IGNORECASE | _re.DOTALL,
+    )
+    if rsa_match:
+        for line in rsa_match.group(1).splitlines():
+            line = line.strip()
+            if not line.startswith("-"):
+                continue
+            line = line.lstrip("-").strip()
+            # Format: Q: <text> | asked_at: HH:MM:SS | pasted_at: HH:MM:SS | delta: N seconds | domain: X | rating: OK
+            q_m  = _re.search(r"Q:\s*([^|]+?)(?=\s*\||$)", line, _re.IGNORECASE)
+            a_m  = _re.search(r"asked_at:\s*([\d:]+)", line, _re.IGNORECASE)
+            p_m  = _re.search(r"pasted_at:\s*([\d:]+)", line, _re.IGNORECASE)
+            d_m  = _re.search(r"delta:\s*(-?\d+)", line, _re.IGNORECASE)
+            dom_m = _re.search(r"domain:\s*([^|]+?)(?=\s*\||$)", line, _re.IGNORECASE)
+            r_m  = _re.search(r"rating:\s*(\w+)", line, _re.IGNORECASE)
+            if q_m or a_m:
+                questions.append({
+                    "question":  q_m.group(1).strip()  if q_m  else "",
+                    "asked_at":  a_m.group(1).strip()  if a_m  else "",
+                    "pasted_at": p_m.group(1).strip()  if p_m  else "",
+                    "delta_sec": d_m.group(1).strip()  if d_m  else "",
+                    "domain":    dom_m.group(1).strip() if dom_m else "",
+                    "speed":     r_m.group(1).strip()  if r_m  else "",
+                })
+
+    # ── Parse Candidate Flag Details bullets ─────────────────────────────────
+    cfd_match = _re.search(
+        r"####\s*Candidate\s*Flag\s*Details[^\n]*\n+(.*?)(?=\n####|\Z)",
+        text, _re.IGNORECASE | _re.DOTALL,
+    )
+    if cfd_match:
+        for line in cfd_match.group(1).splitlines():
+            line = line.strip()
+            if not line.startswith("-"):
+                continue
+            line = line.lstrip("-").strip()
+            # Format: <Category>: VTT timestamp HH:MM:SS | evidence: <text>
+            cat_m = _re.match(r"([^:|]+?):\s*", line)
+            ts_m  = _re.search(r"VTT\s*timestamp\s*([\d:]+)", line, _re.IGNORECASE)
+            if not ts_m:
+                ts_m = _re.search(r"timestamp:?\s*([\d:]+)", line, _re.IGNORECASE)
+            ev_m = _re.search(r"evidence:\s*(.+?)$", line, _re.IGNORECASE)
+            if cat_m:
+                cand_evidence.append({
+                    "category":      _clean_cell(cat_m.group(1).strip()),
+                    "vtt_timestamp": ts_m.group(1).strip() if ts_m else "",
+                    "evidence":      _clean_cell(ev_m.group(1).strip() if ev_m else ""),
+                })
+
+    # ── Parse Proxy Flag Details bullets ─────────────────────────────────────
+    pfd_match = _re.search(
+        r"####\s*Proxy\s*Flag\s*Details[^\n]*\n+(.*?)(?=\n####|\Z)",
+        text, _re.IGNORECASE | _re.DOTALL,
+    )
+    if pfd_match:
+        for line in pfd_match.group(1).splitlines():
+            line = line.strip()
+            if not line.startswith("-"):
+                continue
+            line = line.lstrip("-").strip()
+            # Format: <Category>: triggered by Version N | evidence: <text>
+            cat_m = _re.match(r"([^:|]+?):\s*", line)
+            v_m   = _re.search(r"Versions?\s*([\d,\s]+)", line, _re.IGNORECASE)
+            ev_m  = _re.search(r"evidence:\s*(.+?)$", line, _re.IGNORECASE)
+            if cat_m:
+                proxy_evidence.append({
+                    "category":     _clean_cell(cat_m.group(1).strip()),
+                    "doc_versions": ("Version " + v_m.group(1).strip()) if v_m else "",
+                    "evidence":     _clean_cell(ev_m.group(1).strip() if ev_m else ""),
+                })
+
+    # ── Parse Interviewer Engagement Summary (just verdict text) ─────────────
+    ies_match = _re.search(
+        r"####\s*Interviewer\s*Engagement\s*Summary[^\n]*\n+(.*?)(?=\n####|\Z)",
+        text, _re.IGNORECASE | _re.DOTALL,
+    )
+    if ies_match:
+        verdict_text = ies_match.group(1).strip()
+        # Take first sentence as verdict
+        first_sentence = _re.split(r"[.!]", verdict_text, 1)[0].strip()
+        if first_sentence and len(first_sentence) < 200:
+            result["verdict"] = first_sentence + "."
+
+    # Validation: must have at least name OR chance to be useful
+    if not result["candidate_name"] and not result["chance"]:
+        return None
+
+    # Attach the evidence lists for the smart parser to use
+    result["_questions"]         = questions
+    result["_candidate_evidence"] = cand_evidence
+    result["_proxy_evidence"]     = proxy_evidence
+
+    return result
+
+def _try_extract_native_json(text: str) -> dict:
+    """
+    If the upstream LLM already emitted JSON (per prompt v4.0), parse it directly.
+    Looks for a JSON object that has our expected required fields.
+    Returns dict if found and valid, None otherwise.
+    """
+    # Strip the report header if present
+    body = text
+    if "============================================================" in body:
+        body = body.split("============================================================", 1)[1]
+
+    # Strip markdown code fences if present
+    body = body.strip()
+    if body.startswith("```json"):
+        body = body[7:]
+    if body.startswith("```"):
+        body = body[3:]
+    if body.endswith("```"):
+        body = body[:-3]
+    body = body.strip()
+
+    # Find the first { and matching last } at the same depth
+    if "{" not in body:
+        return None
+    start = body.find("{")
+    # Try parsing from each candidate { until one works
+    for s in range(len(body)):
+        if body[s] != "{":
+            continue
+        # Find matching brace
+        depth = 0
+        for e in range(s, len(body)):
+            if body[e] == "{":
+                depth += 1
+            elif body[e] == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = body[s:e+1]
+                    try:
+                        parsed = json.loads(candidate)
+                        # Validate it has the fields we need
+                        if isinstance(parsed, dict) and "candidate_name" in parsed and "chance_of_moving_to_next_round_pct" in parsed:
+                            return _normalize_native_json(parsed)
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+                    break
+        if s > start + 100:  # don't scan too far
+            break
+    return None
+
+
+def _normalize_native_json(d: dict) -> dict:
+    """Convert prompt v4.0 schema to internal schema (used by GPT parser too)."""
+    # The v4.0 schema uses different key names - normalize them
+    chance = d.get("chance_of_moving_to_next_round_pct", "")
+    if isinstance(chance, int):
+        chance = str(chance)
+    cat_categories = d.get("candidate_action_categories", [])
+    proxy_categories = d.get("proxy_action_categories", [])
+    if isinstance(cat_categories, list):
+        cat_categories = ", ".join(cat_categories)
+    if isinstance(proxy_categories, list):
+        proxy_categories = ", ".join(proxy_categories)
+
+    # Convert questions/evidence arrays - normalize field names
+    questions = []
+    for q in d.get("questions", []) or []:
+        questions.append({
+            "question":  q.get("question", ""),
+            "asked_at":  q.get("asked_at", ""),
+            "pasted_at": q.get("pasted_at", ""),
+            "delta_sec": str(q.get("delta_seconds", "")),
+            "domain":    q.get("domain_type", ""),
+            "speed":     q.get("speed_rating", ""),
+        })
+    cand_ev = []
+    for e in d.get("candidate_evidence", []) or []:
+        cand_ev.append({
+            "category":      e.get("category", ""),
+            "vtt_timestamp": e.get("vtt_timestamp", ""),
+            "evidence":      e.get("evidence", ""),
+        })
+    prxy_ev = []
+    for e in d.get("proxy_evidence", []) or []:
+        prxy_ev.append({
+            "category":     e.get("category", ""),
+            "doc_versions": e.get("doc_versions", ""),
+            "evidence":     e.get("evidence", ""),
+        })
+
+    return {
+        "candidate_name":                  d.get("candidate_name", ""),
+        "chance":                          chance,
+        "candidate_action_required":       d.get("candidate_action_required", ""),
+        "proxy_support_action_required":   d.get("proxy_action_required", ""),
+        "candidate_action_categories":     cat_categories,
+        "proxy_support_action_categories": proxy_categories,
+        "candidate_score":                 d.get("candidate_score", ""),
+        "proxy_score":                     d.get("proxy_score", ""),
+        "verdict":                         d.get("verdict", ""),
+        "round_type":                      d.get("round_type", ""),
+        "duration":                        d.get("duration_minutes", ""),
+        "total_questions":                 str(d.get("session_overview", {}).get("total_questions", "")) if isinstance(d.get("session_overview"), dict) else "",
+        "questions":                       questions,
+        "candidate_evidence":              cand_ev,
+        "proxy_evidence":                  prxy_ev,
+    }
+
+
 def parse_llm_with_gpt(text: str) -> dict:
     """
-    Use GPT-4o-mini with structured output to extract all fields from llm.txt.
-    Returns dict matching LLM_PARSER_SCHEMA, or None if API/import failure.
-    Cached by content hash.
+    LLM-only extractor: GPT-4o-mini with structured JSON output.
+    Cached by SHA256 of input content — same llm.txt never gets re-extracted.
+    
+    Returns dict matching LLM_PARSER_SCHEMA, or None on API/import failure.
     """
     client = _get_openai()
     if client is None:
-        log.warning("OpenAI client unavailable — skipping LLM parse")
+        log.error("OpenAI client unavailable — cannot extract data")
         return None
 
-    # Cache check
+    # Cache check (S3-backed, content-hash keyed)
     cache_key = _llm_cache_key(text)
     cached = _llm_cache_get(cache_key)
     if cached is not None:
-        log.info(f"  LLM parser cache HIT ({cache_key})")
+        log.info(f"  LLM cache HIT ({cache_key[:12]}...) — saved a GPT call")
         return cached
 
-    # Truncate if needed (GPT-4o-mini has 128K context, but our llm.txt is ~3-6K chars)
+    # Truncate input to 50K chars (llm.txt is typically 3-10K chars)
     truncated = text[:50000]
 
     try:
-        log.info(f"  LLM parser: calling GPT-4o-mini ({len(truncated)} chars)")
+        log.info(f"  LLM cache MISS — calling GPT-4o-mini ({len(truncated):,} chars)")
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
@@ -1405,28 +1782,38 @@ def parse_llm_with_gpt(text: str) -> dict:
         )
         raw = response.choices[0].message.content
         parsed = json.loads(raw)
-        # Cache the result
+        
+        # Cache the result for future retries (FREE on cache hit)
         _llm_cache_set(cache_key, parsed)
-        log.info(f"  LLM parser ✅ name={parsed.get('candidate_name','')!r} chance={parsed.get('chance','')!r}")
+        log.info(f"  LLM extraction done, cached as {cache_key[:12]}...")
         return parsed
     except Exception as e:
-        # Log full exception details — not just the message
-        import traceback
-        log.error(f"LLM parser FAILED: {type(e).__name__}: {e}")
-        log.error(f"Traceback: {traceback.format_exc()[:500]}")
+        log.error(f"  LLM extraction failed: {e}")
         return None
-
 
 def parse_llm_smart(text: str) -> tuple:
     """
-    GPT-4o-mini-only parser: always uses LLM for structured extraction.
-    Cached by content hash so the same llm.txt is never parsed twice.
+    LLM-ONLY extraction strategy — uses GPT-4o-mini exclusively for parsing.
+    
+    Why LLM-only:
+      - Most accurate: handles any format variation (Claude/GPT/future models)
+      - Robust: no regex fragility on edge cases (smart quotes, table variations)
+      - Cached: S3 content-hash cache makes retries FREE
+      - Cost: ~$0.0001 per meeting (effectively free)
+    
+    Flow:
+      1. Compute SHA256 of llm.txt content → cache_key
+      2. Check S3 cache → if HIT, return cached result (FREE, instant)
+      3. If MISS, call GPT-4o-mini with structured JSON schema
+      4. Save result to S3 cache for future retries
+    
     Returns (parsed_dict, questions_list, candidate_evidence_list, proxy_evidence_list).
     """
+    log.info("  Parser=LLM-only (GPT-4o-mini with S3 cache)")
     llm_result = parse_llm_with_gpt(text)
 
     if llm_result is None:
-        log.error("  LLM parser FAILED \u2014 returning empty result")
+        log.error("  LLM parser FAILED — returning empty result")
         return _default_result(), [], [], []
 
     parsed = {
@@ -1446,7 +1833,15 @@ def parse_llm_smart(text: str) -> tuple:
     questions = llm_result.get("questions", [])
     cand_ev   = llm_result.get("candidate_evidence", [])
     proxy_ev  = llm_result.get("proxy_evidence", [])
-
+    
+    log.info(
+        f"  Parser=LLM ✅ "
+        f"name='{parsed['candidate_name']}' "
+        f"chance='{parsed['chance']}' "
+        f"questions={len(questions)} "
+        f"cand_ev={len(cand_ev)} "
+        f"proxy_ev={len(proxy_ev)}"
+    )
     return parsed, questions, cand_ev, proxy_ev
 
 def _clean_cell(val: str) -> str:

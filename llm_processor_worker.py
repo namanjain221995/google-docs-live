@@ -3,42 +3,29 @@ llm_processor_worker.py
 =======================
 LLM Analysis Worker — AWS Bedrock Claude Haiku 4.5 + OpenAI GPT-4o-mini fallback
 
-Fallback logic:
-  Primary:  AWS Bedrock (Claude Haiku 4.5) — fast, cheap, cached
-  Fallback: OpenAI GPT-4o-mini — when Bedrock hits daily token quota
-  Both produce the same Flat TOON format output.
+Architecture (senior-engineer pattern):
+  Tier 1: Single call (default — 99% of meetings)
+          Input fits in 200K context window (~720K chars after prompt+output reserve)
+          Faster, cheaper, more coherent output
+  Tier 2: Map-reduce (only when input > 600K chars)
+          MAP:    Split into time-aligned chunks → extract raw facts per chunk
+          REDUCE: Send aggregated facts back → emit final strict v3.1 output
+  Tier 3: OpenAI GPT-4o-mini fallback (when Bedrock throttles)
 
-Flow:
-  1. Scan temp/live-doc-history/ for meetings with done.json but no llm-done.json
-  2. Extract base_prefix from done.json (handles ALL formats)
-  3. Find REAL final S3 path — handles old path (mid inside path) and new path (mid at end)
-  4. Check transcript exists — wait up to 60min with 6 retries
-  5. Read doc.txt + TRANSCRIPT/*.vtt
-  6. Split large doc.txt into chunks (if > MAX_DOC_CHUNK chars)
-  7. Call LLM (Bedrock primary, OpenAI fallback) — each Part gets its own doc chunk
-  8. Save llm.txt to final S3 path
-  9. Write llm-done.json to temp
+Why no more 3-part split for everyone:
+  - Old prompt v3.0 produced 30K+ chars of output → forced 3-part split
+  - New prompt v3.1 produces 3-5K chars of output → fits in one 8K-token response
+  - 200K input context easily holds full doc + full transcript for any real meeting
+  - Single call = better cross-reference, faster, cheaper
 
-Doc chunking:
-  If doc.txt > 150,000 chars → split into chunks
-  Part 1 → Doc chunk 1 (oldest content)
-  Part 2 → Doc chunk 2 (middle content)
-  Part 3 → Doc chunk 3 (newest content — most relevant)
-  OpenAI fallback → last 150K chars (most recent)
-
-Path formats handled (find_real_base_prefix):
-  NEW path: Interview-Success/Host/Year/Month/Candidate/Company/Date/Round/MeetingID/
-  OLD path: Interview-Success/Host/Year/Month/Candidate/MeetingID/Company/Date/Round/Time/
-  ANY path: if meeting_id appears anywhere in path, we scan S3 to find real TRANSCRIPT location
-
-done.json formats supported:
-  Format A (old finalizer):  "final_s3_prefix": "Interview-Success/..."
-  Format B (new finalizer):  "final_s3_prefix" + "final_doc_txt" + "temp_prefix"
-  Format C (llm format):     "base_prefix": "Interview-Success/..."
-  Format D (fallback):       extract from "final_doc_txt" by stripping /docs/doc.txt
-
-Departments supported:
-  Interview-Success, Training, Customer-Success, Marketing
+Output format (strict v3.1):
+  ### Table 1: Proxy Support Performance Table
+  ### Table 2: Candidate Performance Table
+  #### Response Speed Analysis (bullets)
+  #### Proxy Flag Details (bullets)
+  #### Candidate Flag Details (bullets)
+  #### Interviewer Engagement Summary
+  #### Session Overview (bullets)
 """
 
 import os
@@ -62,7 +49,20 @@ PROMPT_FILE       = os.environ.get("PROMPT_FILE",
 
 BEDROCK_MODEL_ID  = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 OPENAI_MODEL_ID   = "gpt-4o-mini"
-MAX_OUTPUT_TOKENS = 8192
+
+# Output token limits (max for each model — never truncate)
+BEDROCK_MAX_OUTPUT_TOKENS = 8192    # Claude Haiku 4.5 hard limit
+OPENAI_MAX_OUTPUT_TOKENS  = 16384   # GPT-4o-mini hard limit
+
+# Input thresholds (in chars, ~4 chars per token)
+# Claude Haiku 4.5 has 200K token context = ~800K chars
+# Reserve: 11.5K tokens prompt + 8.2K output + 0.5K overhead = ~20K tokens
+# Available for input: ~180K tokens = ~720K chars
+# Set conservative threshold at 600K to leave buffer for prompt-cache misses
+SINGLE_CALL_INPUT_LIMIT = 600_000   # chars — single call up to this size
+MAP_REDUCE_CHUNK_SIZE   = 200_000   # chars per chunk in map-reduce mode
+OPENAI_FALLBACK_INPUT_LIMIT = 480_000  # GPT-4o-mini 128K context = ~512K chars
+
 BACKFILL_WORKERS  = 30
 SCAN_INTERVAL     = 120
 IST_OFFSET        = timedelta(hours=5, minutes=30)
@@ -70,13 +70,7 @@ IST_OFFSET        = timedelta(hours=5, minutes=30)
 THROTTLE_ERRORS        = ("ThrottlingException", "Too many tokens", "rate limit", "quota")
 MAX_TRANSCRIPT_RETRIES = 6
 RETRY_WAIT_MINUTES     = 10
-SMART_SKIP_THRESHOLD   = 7
 
-# Large doc chunking — if doc.txt exceeds this, split into chunks
-# 150K chars ≈ 37K tokens — safe for both Bedrock and OpenAI context windows
-MAX_DOC_CHUNK = 150_000
-
-# All top-level S3 departments to search when doing meeting_id scan
 S3_DEPARTMENTS = [
     "Interview-Success",
     "Training",
@@ -136,7 +130,6 @@ def get_prompt():
 # ── S3 HELPERS ────────────────────────────────────────────────────────────────
 
 def s3_read(key):
-    """Read S3 object as UTF-8 string. Returns '' on any error."""
     try:
         return s3c.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read().decode("utf-8")
     except Exception:
@@ -157,63 +150,7 @@ def s3_put_text(key, text):
     )
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DOC CHUNKING — split large doc.txt into parts
-# ══════════════════════════════════════════════════════════════════════════════
-
-def split_doc_chunks(doc_text: str) -> list:
-    """
-    Split large doc.txt into chunks of MAX_DOC_CHUNK chars.
-    Splits on newline boundaries to avoid cutting mid-line.
-
-    Returns list of strings:
-      - If doc fits in one chunk: [doc_text]
-      - If doc is large: [chunk1, chunk2, chunk3, ...]
-
-    Each Part call gets its assigned chunk:
-      Part 1 → chunk 0 (oldest doc versions)
-      Part 2 → chunk 1 (middle doc versions)
-      Part 3 → last chunk (newest/most recent doc versions)
-    """
-    if len(doc_text) <= MAX_DOC_CHUNK:
-        return [doc_text]
-
-    chunks = []
-    start  = 0
-    while start < len(doc_text):
-        end = start + MAX_DOC_CHUNK
-        if end < len(doc_text):
-            # Find nearest newline to avoid cutting mid-line
-            nl = doc_text.rfind("\n", start, end)
-            if nl > start:
-                end = nl
-        chunks.append(doc_text[start:end])
-        start = end
-
-    return chunks
-
-
-def get_doc_chunk_for_part(chunks: list, part_num: int, total_parts: int = 3) -> str:
-    """
-    Get the right doc chunk for a given LLM part.
-    Part 1 → first chunk (oldest content)
-    Part 2 → middle chunk
-    Part 3 → last chunk (newest/most relevant content)
-
-    If there are more than 3 chunks, Part 3 always gets the last one.
-    """
-    if len(chunks) == 1:
-        return chunks[0]
-
-    if part_num == 1:
-        return chunks[0]
-    elif part_num == 3:
-        return chunks[-1]
-    else:  # Part 2
-        mid = len(chunks) // 2
-        return chunks[mid]
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PATH RESOLUTION — handles EVERY path format
+# PATH RESOLUTION — handles every path format
 # ══════════════════════════════════════════════════════════════════════════════
 
 def extract_base_prefix(done: dict) -> tuple:
@@ -455,20 +392,16 @@ def scan_s3_for_unprocessed() -> list:
             lm    = obj.get("LastModified")
             parts = key.split("/")
 
-            # NEW: temp/live-doc-history/YYYY/Month-M/YYYY-MM-DD/mid/file
             if (len(parts) >= 7
                     and parts[2].isdigit() and len(parts[2]) == 4
                     and parts[3].startswith("Month-")):
                 mid = parts[5]
                 fn  = parts[6]
                 pfx = "/".join(parts[:6])
-
-            # OLD: temp/live-doc-history/mid/file
             elif len(parts) == 4 and parts[2].isdigit():
                 mid = parts[2]
                 fn  = parts[3]
                 pfx = "/".join(parts[:3])
-
             else:
                 continue
 
@@ -485,8 +418,7 @@ def scan_s3_for_unprocessed() -> list:
     pending = [
         {"mid": mid, "pfx": info["pfx"], "lm": info["lm"]}
         for mid, info in has_done.items()
-        if mid not in has_llm_done
-        and mid not in has_llm_error
+        if mid not in has_llm_done and mid not in has_llm_error
     ]
 
     pending.sort(
@@ -503,7 +435,65 @@ def scan_s3_for_unprocessed() -> list:
     return pending
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LLM — OPENAI (single call, 16K output)
+# CHUNKING — ONLY USED FOR MAP-REDUCE MODE (input > 600K chars)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def split_by_size(text: str, max_chars: int) -> list:
+    """Split text into chunks of max_chars, preferring newline boundaries."""
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + max_chars
+        if end < len(text):
+            nl = text.rfind("\n", start, end)
+            if nl > start + max_chars // 2:  # don't cut too short
+                end = nl
+        chunks.append(text[start:end])
+        start = end
+    return chunks
+
+
+def split_for_map_reduce(doc_text: str, transcript_text: str) -> list:
+    """
+    For very large inputs (>600K chars total), split into time-aligned chunks.
+    Each chunk gets a slice of doc + a slice of transcript covering same time window.
+
+    Returns list of (doc_chunk, transcript_chunk, label) tuples.
+    """
+    total = len(doc_text) + len(transcript_text)
+    if total <= SINGLE_CALL_INPUT_LIMIT:
+        return [(doc_text, transcript_text, "FULL")]
+
+    # Determine number of chunks needed (each chunk ≤ MAP_REDUCE_CHUNK_SIZE total)
+    n_chunks = max(2, (total + MAP_REDUCE_CHUNK_SIZE - 1) // MAP_REDUCE_CHUNK_SIZE)
+    n_chunks = min(n_chunks, 5)  # cap at 5 chunks to bound cost
+
+    # Split each proportionally
+    doc_chunks        = split_by_size(doc_text, len(doc_text) // n_chunks + 1)
+    transcript_chunks = split_by_size(transcript_text, len(transcript_text) // n_chunks + 1)
+
+    # Pad shorter list with empty strings so they zip evenly
+    while len(doc_chunks) < n_chunks:
+        doc_chunks.append("")
+    while len(transcript_chunks) < n_chunks:
+        transcript_chunks.append("")
+
+    result = []
+    for i in range(n_chunks):
+        if i == 0:
+            label = f"EARLY (1/{n_chunks})"
+        elif i == n_chunks - 1:
+            label = f"LATE ({n_chunks}/{n_chunks})"
+        else:
+            label = f"MID ({i+1}/{n_chunks})"
+        result.append((doc_chunks[i], transcript_chunks[i], label))
+    return result
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OPENAI FALLBACK
 # ══════════════════════════════════════════════════════════════════════════════
 
 _openai_key      = None
@@ -531,7 +521,7 @@ def call_openai_raw(messages: list) -> str:
     api_key = get_openai_key()
     payload = json.dumps({
         "model":      OPENAI_MODEL_ID,
-        "max_tokens": 16000,
+        "max_tokens": OPENAI_MAX_OUTPUT_TOKENS,
         "messages":   messages,
     }).encode("utf-8")
 
@@ -552,26 +542,26 @@ def call_openai_raw(messages: list) -> str:
 def run_llm_openai(doc_text: str, transcript_text: str,
                    meeting_id: str) -> tuple:
     """
-    Single-call OpenAI fallback.
-    For large docs: use last MAX_DOC_CHUNK chars (most recent/relevant content).
+    OpenAI single-call fallback. For oversized input, truncates to last
+    OPENAI_FALLBACK_INPUT_LIMIT chars (most recent content).
     Returns (output_text, "openai")
     """
     prompt = get_prompt()
 
-    # For large docs, OpenAI gets the most recent content (last chunk)
-    if len(doc_text) > MAX_DOC_CHUNK:
-        doc_for_llm = doc_text[-MAX_DOC_CHUNK:]
+    total = len(doc_text) + len(transcript_text)
+    if total > OPENAI_FALLBACK_INPUT_LIMIT:
+        # Reserve half for transcript, half for doc
+        per_side = OPENAI_FALLBACK_INPUT_LIMIT // 2
+        doc_for_llm        = doc_text[-per_side:]
+        transcript_for_llm = transcript_text[-per_side:]
         log.info(
-            f"[{meeting_id}] OpenAI: large doc truncated "
-            f"{len(doc_text):,} → {MAX_DOC_CHUNK:,} chars (last/newest content)"
+            f"[{meeting_id}] OpenAI: input {total:,} > {OPENAI_FALLBACK_INPUT_LIMIT:,} "
+            f"chars — truncated to last {per_side:,} per side"
         )
     else:
-        doc_for_llm = doc_text
+        doc_for_llm        = doc_text
+        transcript_for_llm = transcript_text if transcript_text else "N/A"
 
-    input_text = (
-        f"DOCUMENT:\n{doc_for_llm}\n\n"
-        f"TRANSCRIPT:\n{transcript_text if transcript_text else 'N/A'}"
-    )
     now_utc = datetime.now(timezone.utc)
     header  = (
         f"LLM ANALYSIS REPORT\n"
@@ -581,15 +571,21 @@ def run_llm_openai(doc_text: str, transcript_text: str,
         f"Model: GPT-4o-mini (OpenAI fallback)\n"
         f"\n{'=' * 60}\n"
     )
+
     log.info(f"[{meeting_id}] OpenAI single-call starting...")
     result = call_openai_raw([
         {"role": "system", "content": prompt},
         {
             "role": "user",
             "content": (
-                f"{prompt}\n\n"
-                f"Generate the COMPLETE analysis with ALL sections.\n\n"
-                f"{input_text}"
+                f"Analyze this interview session and produce the output following "
+                f"STRICT_OUTPUT_FORMAT_ENFORCEMENT exactly.\n\n"
+                f"MANDATORY: Start your response with '### Table 1:' — no preamble, "
+                f"no analysis steps, no audit headers, no PART 1/2/3 labels.\n\n"
+                f"OUTPUT EVERYTHING FULLY. Do not truncate. List every Q&A pair, "
+                f"every flagged category, every piece of evidence.\n\n"
+                f"DOCUMENT:\n{doc_for_llm}\n\n"
+                f"TRANSCRIPT:\n{transcript_for_llm}"
             ),
         },
     ])
@@ -597,13 +593,14 @@ def run_llm_openai(doc_text: str, transcript_text: str,
     return header + result, "openai"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LLM — BEDROCK (3-part split + doc chunking for large docs)
+# BEDROCK CALL
 # ══════════════════════════════════════════════════════════════════════════════
 
-def call_bedrock_streaming(user_message: str, system_prompt: str) -> str:
+def call_bedrock_streaming(user_message: str, system_prompt: str,
+                            max_tokens: int = None) -> str:
     body = json.dumps({
         "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens":        MAX_OUTPUT_TOKENS,
+        "max_tokens":        max_tokens or BEDROCK_MAX_OUTPUT_TOKENS,
         "system": [
             {
                 "type":          "text",
@@ -637,24 +634,19 @@ def call_bedrock_streaming(user_message: str, system_prompt: str) -> str:
     return "".join(chunks)
 
 
-def run_llm_bedrock(doc_text: str, transcript_text: str,
-                    meeting_id: str) -> tuple:
+# ══════════════════════════════════════════════════════════════════════════════
+# TIER 1: SINGLE-CALL BEDROCK (default, fits 99% of meetings)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_bedrock_single_call(doc_text: str, transcript_text: str,
+                              meeting_id: str) -> tuple:
     """
-    3-part Bedrock call with doc chunking for large docs.
-
-    Normal doc (≤150K chars):
-      All 3 parts get the full doc — same as before.
-
-    Large doc (>150K chars):
-      Split into chunks. Each Part gets its assigned chunk:
-        Part 1 → chunk[0]  (oldest doc versions)
-        Part 2 → chunk[mid] (middle doc versions)
-        Part 3 → chunk[-1]  (newest/most recent doc versions)
-
-    Smart skip: if Part 1 already has 7+/8 final sections → skip Parts 2+3.
+    Single Bedrock call with FULL doc + FULL transcript.
+    Used when input <= SINGLE_CALL_INPUT_LIMIT (600K chars).
+    Emits full strict v3.1 output.
     Returns (output_text, "bedrock")
     """
-    prompt  = get_prompt()
+    prompt     = get_prompt()
     transcript = transcript_text if transcript_text else "N/A"
 
     now_utc = datetime.now(timezone.utc)
@@ -666,125 +658,206 @@ def run_llm_bedrock(doc_text: str, transcript_text: str,
         f"Model: Claude Haiku 4.5 (AWS Bedrock)\n"
         f"\n{'=' * 60}\n"
     )
-    final_sections = [
-        "overall_candidate_performance",
-        "overall_proxy_support_performance",
-        "overall_interviewer_performance",
-        "chance_of_moving_forward",
-        "if_chances_are_less_next_time_plan",
-        "mistake_and_risk_ledger",
-        "final_verdict",
-        "insufficient_context",
-    ]
 
-    # ── Split doc into chunks if needed ───────────────────────────────────────
-    doc_chunks = split_doc_chunks(doc_text)
-    n_chunks   = len(doc_chunks)
+    total = len(doc_text) + len(transcript_text)
+    log.info(
+        f"[{meeting_id}] Bedrock single-call: doc={len(doc_text):,} + "
+        f"transcript={len(transcript_text):,} = {total:,} chars"
+    )
 
-    if n_chunks > 1:
-        log.info(
-            f"[{meeting_id}] Large doc ({len(doc_text):,} chars) → "
-            f"{n_chunks} chunks of ~{MAX_DOC_CHUNK:,} chars each"
-        )
-    else:
-        log.info(f"[{meeting_id}] Doc: {len(doc_text):,} chars (single chunk)")
-
-    def make_input(part_num: int) -> str:
-        """Build DOCUMENT + TRANSCRIPT input for a given part number."""
-        doc_chunk = get_doc_chunk_for_part(doc_chunks, part_num)
-        if n_chunks > 1:
-            chunk_idx = {1: 0, 2: len(doc_chunks)//2, 3: len(doc_chunks)-1}[part_num]
-            chunk_label = f"[DOC PART {chunk_idx+1}/{n_chunks} — "
-            if part_num == 1:
-                chunk_label += "OLDEST CONTENT]\n"
-            elif part_num == 3:
-                chunk_label += "NEWEST/MOST RECENT CONTENT]\n"
-            else:
-                chunk_label += "MIDDLE CONTENT]\n"
-            doc_chunk = chunk_label + doc_chunk
-        return (
-            f"DOCUMENT:\n{doc_chunk}\n\n"
+    result = call_bedrock_streaming(
+        user_message=(
+            f"Analyze this interview session and produce the output following "
+            f"STRICT_OUTPUT_FORMAT_ENFORCEMENT exactly.\n\n"
+            f"MANDATORY: Start your response with '### Table 1:' — no preamble, "
+            f"no analysis steps, no audit headers, no PART 1/2/3 labels.\n\n"
+            f"Emit the FULL strict format COMPLETELY:\n"
+            f"  ### Table 1: Proxy Support Performance Table\n"
+            f"  ### Table 2: Candidate Performance Table\n"
+            f"  #### Response Speed Analysis (list EVERY Q&A pair)\n"
+            f"  #### Proxy Flag Details (list EVERY flagged category)\n"
+            f"  #### Candidate Flag Details (list EVERY flagged category)\n"
+            f"  #### Interviewer Engagement Summary (3-5 sentences)\n"
+            f"  #### Session Overview (all 6 metrics as bullets)\n\n"
+            f"OUTPUT EVERYTHING FULLY. Do not truncate, do not abbreviate. "
+            f"You have 8192 tokens — use them as needed for complete output.\n\n"
+            f"DOCUMENT:\n{doc_text}\n\n"
             f"TRANSCRIPT:\n{transcript}"
-        )
-
-    # ── Part 1 ────────────────────────────────────────────────────────────────
-    log.info(f"[{meeting_id}] Bedrock Part 1 starting...")
-    inp1  = make_input(1)
-    part1 = call_bedrock_streaming(
-        f"{prompt}\n\n"
-        f"OUTPUT PART 1: Generate these sections only:\n"
-        f"audit_metadata, audit_summary_card, role_identification, "
-        f"flat_summary, overall_dynamics_of_interview, "
-        f"question_answer_support_mapping\n\n"
-        f"{inp1}",
-        prompt,
+        ),
+        system_prompt=prompt,
     )
-    log.info(f"[{meeting_id}] Part 1 done ({len(part1)} chars)")
-
-    found = sum(1 for s in final_sections if s in part1)
-    if found >= SMART_SKIP_THRESHOLD:
-        log.info(f"[{meeting_id}] Smart skip: {found}/8 final sections in Part 1 ✅")
-        return header + part1, "bedrock"
-
-    # ── Part 2 ────────────────────────────────────────────────────────────────
-    log.info(f"[{meeting_id}] Bedrock Part 2 starting...")
-    inp2  = make_input(2)
-    part2 = call_bedrock_streaming(
-        f"{prompt}\n\n"
-        f"CONTINUATION — Part 2.\n"
-        f"Previous output (last 3000 chars):\n{part1[-3000:]}\n\n"
-        f"OUTPUT PART 2: Generate ONLY missing sections:\n"
-        f"overall_candidate_performance, overall_proxy_support_performance, "
-        f"overall_interviewer_performance, chance_of_moving_forward\n"
-        f"DO NOT regenerate any section already in Part 1.\n\n"
-        f"{inp2}",
-        prompt,
-    )
-    log.info(f"[{meeting_id}] Part 2 done ({len(part2)} chars)")
-
-    combined = part1 + "\n" + part2
-    found2   = sum(1 for s in final_sections if s in combined)
-    if found2 >= SMART_SKIP_THRESHOLD:
-        log.info(f"[{meeting_id}] Smart skip after Part 2: {found2}/8 ✅")
-        return header + combined, "bedrock"
-
-    # ── Part 3 ────────────────────────────────────────────────────────────────
-    log.info(f"[{meeting_id}] Bedrock Part 3 starting...")
-    inp3  = make_input(3)
-    part3 = call_bedrock_streaming(
-        f"{prompt}\n\n"
-        f"CONTINUATION — Part 3 (final).\n"
-        f"Previous output (last 2000 chars):\n{combined[-2000:]}\n\n"
-        f"OUTPUT PART 3: Generate ONLY missing sections:\n"
-        f"if_chances_are_less_next_time_plan, mistake_and_risk_ledger, "
-        f"final_verdict, insufficient_context\n"
-        f"DO NOT regenerate any section already written. "
-        f"STOP after insufficient_context.\n\n"
-        f"{inp3}",
-        prompt,
-    )
-    log.info(f"[{meeting_id}] Part 3 done ({len(part3)} chars)")
-    return header + combined + "\n" + part3, "bedrock"
+    log.info(f"[{meeting_id}] Bedrock single-call done ({len(result)} chars)")
+    return header + result, "bedrock"
 
 
-def run_llm_3part(doc_text: str, transcript_text: str,
-                  meeting_id: str) -> tuple:
+# ══════════════════════════════════════════════════════════════════════════════
+# TIER 2: MAP-REDUCE BEDROCK (only for input > 600K chars)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_bedrock_map_reduce(doc_text: str, transcript_text: str,
+                             meeting_id: str) -> tuple:
     """
-    Master LLM runner:
-      Try Bedrock (3-part split + doc chunking) → on throttle → OpenAI fallback
+    Map-reduce for very large inputs (>600K chars).
+
+    MAP phase:
+      For each (doc_chunk, transcript_chunk, label) — call Bedrock to extract
+      raw facts: Q&A pairs, candidate evidence, proxy evidence (no scoring,
+      no tables, no opinions — just facts with timestamps).
+
+    REDUCE phase:
+      Send aggregated facts back to Bedrock with full strict prompt to emit
+      the final tables + sections.
+
+    This pattern preserves coherent reasoning at the reduce step while
+    breaking the input where it actually exceeds limits.
+
+    Returns (output_text, "bedrock")
+    """
+    prompt = get_prompt()
+    chunks = split_for_map_reduce(doc_text, transcript_text)
+    n      = len(chunks)
+
+    log.info(
+        f"[{meeting_id}] Map-reduce mode: {len(doc_text)+len(transcript_text):,} "
+        f"chars > {SINGLE_CALL_INPUT_LIMIT:,} → splitting into {n} chunks"
+    )
+
+    # ── MAP PHASE ─────────────────────────────────────────────────────────────
+    map_facts = []
+    for i, (doc_c, trans_c, label) in enumerate(chunks, 1):
+        log.info(f"[{meeting_id}] Map {i}/{n} ({label}): "
+                 f"doc={len(doc_c):,} + transcript={len(trans_c):,} chars")
+
+        map_instruction = (
+            f"Fact-extraction phase {i}/{n} (chunk: {label}).\n\n"
+            f"Extract RAW FACTS only from this chunk. NO scoring, NO tables, "
+            f"NO summaries, NO opinions, NO action_required values. "
+            f"Just observed facts with timestamps.\n\n"
+            f"Output format (markdown bullets ONLY):\n\n"
+            f"#### Q&A Pairs (chunk {label})\n"
+            f"- Q: <question text> | asked_at: HH:MM:SS | pasted_at: HH:MM:SS | "
+            f"delta: N seconds | domain: <domain>\n\n"
+            f"#### Candidate Observations (chunk {label})\n"
+            f"- VTT HH:MM:SS | category: <closest enum from CANDIDATE_ACTION_CATEGORIES_ENUM> | "
+            f"observation: <what was said/done>\n\n"
+            f"#### Proxy Observations (chunk {label})\n"
+            f"- Version N | category: <closest enum from PROXY_ACTION_CATEGORIES_ENUM> | "
+            f"observation: <what was pasted/missed>\n\n"
+            f"#### Interviewer Signals (chunk {label})\n"
+            f"- HH:MM:SS | signal: <description>\n\n"
+            f"Use ONLY enum strings for categories. Output ONLY these 4 sections, "
+            f"nothing else. No tables, no scoring.\n\n"
+            f"DOCUMENT chunk:\n{doc_c}\n\n"
+            f"TRANSCRIPT chunk:\n{trans_c if trans_c else 'N/A'}"
+        )
+        try:
+            facts = call_bedrock_streaming(
+                user_message=map_instruction,
+                system_prompt=prompt,
+            )
+            map_facts.append(f"=== CHUNK {label} ===\n{facts}")
+            log.info(f"[{meeting_id}] Map {i}/{n} done ({len(facts):,} chars)")
+        except Exception as e:
+            log.warning(f"[{meeting_id}] Map {i}/{n} failed: {e} — continuing")
+
+    if not map_facts:
+        raise RuntimeError(f"[{meeting_id}] Map phase produced no facts")
+
+    # ── REDUCE PHASE ──────────────────────────────────────────────────────────
+    aggregated = "\n\n".join(map_facts)
+    log.info(
+        f"[{meeting_id}] Reduce phase starting: "
+        f"{len(aggregated):,} chars of aggregated facts"
+    )
+
+    # If aggregated facts are still too large, truncate (rare)
+    if len(aggregated) > SINGLE_CALL_INPUT_LIMIT:
+        log.warning(
+            f"[{meeting_id}] Aggregated facts {len(aggregated):,} > "
+            f"{SINGLE_CALL_INPUT_LIMIT:,} — truncating to last N chars"
+        )
+        aggregated = aggregated[-SINGLE_CALL_INPUT_LIMIT:]
+
+    reduce_instruction = (
+        f"Synthesis phase. Below are extracted facts from {n} chunks of a single "
+        f"interview session. Produce the FINAL output following "
+        f"STRICT_OUTPUT_FORMAT_ENFORCEMENT exactly.\n\n"
+        f"MANDATORY: Start with '### Table 1:' — no preamble.\n\n"
+        f"Emit the FULL strict format:\n"
+        f"  ### Table 1: Proxy Support Performance Table\n"
+        f"  ### Table 2: Candidate Performance Table\n"
+        f"  #### Response Speed Analysis (consolidated from all chunks)\n"
+        f"  #### Proxy Flag Details (consolidated)\n"
+        f"  #### Candidate Flag Details (consolidated)\n"
+        f"  #### Interviewer Engagement Summary\n"
+        f"  #### Session Overview\n\n"
+        f"Aggregate evidence across chunks. Compute scores from the full picture. "
+        f"Apply all 14 scoring rules from the prompt to the consolidated facts. "
+        f"Use ONLY enum strings. OUTPUT EVERYTHING FULLY.\n\n"
+        f"AGGREGATED FACTS FROM ALL CHUNKS:\n\n{aggregated}"
+    )
+
+    final = call_bedrock_streaming(
+        user_message=reduce_instruction,
+        system_prompt=prompt,
+    )
+
+    now_utc = datetime.now(timezone.utc)
+    header  = (
+        f"LLM ANALYSIS REPORT\n"
+        f"Meeting ID: {meeting_id}\n"
+        f"Generated At: {now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC "
+        f"({(now_utc + IST_OFFSET).strftime('%Y-%m-%d %I:%M:%S %p')} IST)\n"
+        f"Model: Claude Haiku 4.5 (AWS Bedrock — map-reduce {n} chunks)\n"
+        f"\n{'=' * 60}\n"
+    )
+    log.info(f"[{meeting_id}] Reduce done ({len(final):,} chars)")
+    return header + final, "bedrock"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MASTER LLM RUNNER (Tier 1 → Tier 2 → Tier 3)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_llm(doc_text: str, transcript_text: str, meeting_id: str) -> tuple:
+    """
+    Master LLM runner.
+      Tier 1: Single-call Bedrock (default — most meetings)
+      Tier 2: Map-reduce Bedrock (only when input > 600K chars)
+      Tier 3: OpenAI fallback (when Bedrock throttles)
     Returns (output_text, provider)
     """
-    # Primary: Bedrock
-    try:
-        return run_llm_bedrock(doc_text, transcript_text, meeting_id)
-    except Exception as e:
-        if is_throttle_error(e):
-            log.warning(
-                f"[{meeting_id}] Bedrock throttled — "
-                f"falling back to OpenAI GPT-4o-mini (single call)"
-            )
-        else:
-            raise
+    total_input = len(doc_text) + len(transcript_text)
+
+    # Choose Bedrock strategy by input size
+    if total_input <= SINGLE_CALL_INPUT_LIMIT:
+        strategy = "single-call"
+        try:
+            return run_bedrock_single_call(doc_text, transcript_text, meeting_id)
+        except Exception as e:
+            if is_throttle_error(e):
+                log.warning(
+                    f"[{meeting_id}] Bedrock {strategy} throttled — "
+                    f"falling back to OpenAI"
+                )
+            else:
+                raise
+    else:
+        strategy = "map-reduce"
+        log.info(
+            f"[{meeting_id}] Input {total_input:,} chars > "
+            f"{SINGLE_CALL_INPUT_LIMIT:,} threshold — using map-reduce"
+        )
+        try:
+            return run_bedrock_map_reduce(doc_text, transcript_text, meeting_id)
+        except Exception as e:
+            if is_throttle_error(e):
+                log.warning(
+                    f"[{meeting_id}] Bedrock {strategy} throttled — "
+                    f"falling back to OpenAI"
+                )
+            else:
+                raise
 
     # Fallback: OpenAI
     try:
@@ -792,6 +865,11 @@ def run_llm_3part(doc_text: str, transcript_text: str,
     except Exception as e:
         log.error(f"[{meeting_id}] OpenAI fallback also failed: {e}")
         raise
+
+
+# Legacy alias — keep for backwards compatibility
+run_llm_3part = run_llm
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CORE: PROCESS ONE MEETING
@@ -802,7 +880,6 @@ def process_one_meeting(item: dict) -> str:
     pfx = item["pfx"]
     log.info(f"[{mid}] ── Processing ──")
 
-    # ── Step 1: Read done.json ────────────────────────────────────────────────
     done_raw = s3_read(f"{pfx}/done.json")
     if not done_raw:
         return f"SKIP {mid} — done.json missing"
@@ -811,10 +888,8 @@ def process_one_meeting(item: dict) -> str:
     except Exception:
         return f"SKIP {mid} — done.json parse error"
 
-    # ── Step 2: Stub done.json check (no path) ────────────────────────────────
     raw_prefix, key_used = extract_base_prefix(done)
     if not raw_prefix:
-        # Stub done.json — no Google Doc activity, nothing to process
         now_utc = datetime.now(timezone.utc)
         s3_put_json(f"{pfx}/llm-error.json", {
             "meeting_id":   mid,
@@ -829,13 +904,10 @@ def process_one_meeting(item: dict) -> str:
 
     log.info(f"[{mid}] raw_prefix='{raw_prefix}' (from '{key_used}')")
 
-    # ── Step 3: Resolve REAL base_prefix ──────────────────────────────────────
     base_prefix = resolve_real_base_prefix(raw_prefix, mid)
     log.info(f"[{mid}] base_prefix='{base_prefix}'")
 
-    # ── Step 4: Transcript wait check ─────────────────────────────────────────
     t_status = transcript_wait_check(mid, pfx, base_prefix)
-
     if t_status == "wait":
         return f"WAIT {mid} — transcript not ready, retry in ~{RETRY_WAIT_MINUTES}min"
     if t_status == "stop":
@@ -845,7 +917,6 @@ def process_one_meeting(item: dict) -> str:
             f"({MAX_TRANSCRIPT_RETRIES * RETRY_WAIT_MINUTES} min)"
         )
 
-    # ── Step 5: Read doc.txt ──────────────────────────────────────────────────
     doc_txt = s3_read(f"{base_prefix}/docs/doc.txt")
     if not doc_txt:
         log.warning(f"[{mid}] doc.txt not found at {base_prefix}/docs/doc.txt — trying raw path")
@@ -855,17 +926,15 @@ def process_one_meeting(item: dict) -> str:
 
     log.info(f"[{mid}] doc.txt: {len(doc_txt):,} chars")
 
-    # ── Step 6: Read transcript ───────────────────────────────────────────────
     transcript_text = get_transcript_text(base_prefix)
     log.info(
         f"[{mid}] Transcript: {len(transcript_text):,} chars"
         f"{' (empty)' if not transcript_text else ''}"
     )
 
-    # ── Step 7: Run LLM ───────────────────────────────────────────────────────
     log.info(f"[{mid}] Starting LLM analysis...")
     try:
-        llm_output, provider = run_llm_3part(doc_txt, transcript_text, mid)
+        llm_output, provider = run_llm(doc_txt, transcript_text, mid)
     except Exception as e:
         log.error(f"[{mid}] LLM call failed: {e}", exc_info=True)
         return f"ERROR {mid} — LLM failed: {e}"
@@ -875,19 +944,17 @@ def process_one_meeting(item: dict) -> str:
 
     log.info(f"[{mid}] LLM output: {len(llm_output):,} chars via {provider}")
 
-    # ── Step 8: Save llm.txt ──────────────────────────────────────────────────
     llm_key = f"{base_prefix}/llm/llm.txt"
     s3_put_text(llm_key, llm_output)
     log.info(f"[{mid}] ✅ llm.txt saved → {llm_key}")
 
-    # ── Step 9: Write llm-done.json ───────────────────────────────────────────
     now_utc = datetime.now(timezone.utc)
     model_str = (
         "claude-haiku-4-5 (AWS Bedrock)" if provider == "bedrock"
         else "gpt-4o-mini (OpenAI)"       if provider == "openai"
         else f"mixed ({provider})"
     )
-    doc_chunks_count = len(split_doc_chunks(doc_txt))
+    total_input = len(doc_txt) + len(transcript_text)
     s3_put_json(f"{pfx}/llm-done.json", {
         "meeting_id":       mid,
         "status":           "llm_processed",
@@ -895,10 +962,12 @@ def process_one_meeting(item: dict) -> str:
         "processed_at_ist": (now_utc + IST_OFFSET).strftime("%Y-%m-%d %I:%M:%S %p IST"),
         "model":            model_str,
         "provider":         provider,
+        "strategy":         "map-reduce" if total_input > SINGLE_CALL_INPUT_LIMIT else "single-call",
         "llm_txt":          f"s3://{S3_BUCKET}/{llm_key}",
         "doc_source":       f"s3://{S3_BUCKET}/{base_prefix}/docs/doc.txt",
         "doc_chars":        len(doc_txt),
-        "doc_chunks":       doc_chunks_count,
+        "transcript_chars": len(transcript_text),
+        "input_chars":      total_input,
         "transcript":       "found" if transcript_text else "N/A",
         "base_prefix":      base_prefix,
         "raw_prefix":       raw_prefix,
@@ -907,8 +976,7 @@ def process_one_meeting(item: dict) -> str:
     })
     log.info(f"[{mid}] ✅ llm-done.json written")
 
-    # ── Step 10: Cost estimate ────────────────────────────────────────────────
-    input_tokens  = (len(doc_txt) + len(transcript_text)) // 4
+    input_tokens  = total_input // 4
     output_tokens = len(llm_output) // 4
     if provider == "bedrock":
         est_cost = (input_tokens / 1_000_000 * 0.80) + (output_tokens / 1_000_000 * 4.00)
@@ -918,7 +986,6 @@ def process_one_meeting(item: dict) -> str:
     log.info(
         f"[{mid}] 💰 ~{input_tokens:,} in / ~{output_tokens:,} out "
         f"/ est ~${est_cost:.4f} / provider={provider}"
-        f"{f' / doc_chunks={doc_chunks_count}' if doc_chunks_count > 1 else ''}"
     )
 
     return f"OK {mid} | {len(llm_output):,} chars | ${est_cost:.4f} | {provider}"
@@ -979,16 +1046,17 @@ def backfill_loop():
 
 def main():
     log.info("=" * 60)
-    log.info("llm_processor_worker starting")
-    log.info(f"  Primary model:      {BEDROCK_MODEL_ID}")
-    log.info(f"  Fallback model:     {OPENAI_MODEL_ID}")
-    log.info(f"  Workers:            {BACKFILL_WORKERS}")
-    log.info(f"  Max output tokens:  {MAX_OUTPUT_TOKENS} (Bedrock) / 16000 (OpenAI)")
-    log.info(f"  Smart skip at:      {SMART_SKIP_THRESHOLD}/8 sections")
-    log.info(f"  Transcript retries: {MAX_TRANSCRIPT_RETRIES} × {RETRY_WAIT_MINUTES}min")
-    log.info(f"  Scan interval:      {SCAN_INTERVAL}s")
-    log.info(f"  Max doc chunk:      {MAX_DOC_CHUNK:,} chars")
-    log.info(f"  Path resolution:    auto (new + old + S3 scan fallback)")
+    log.info("llm_processor_worker starting (prompt v3.1 — single-call + map-reduce)")
+    log.info(f"  Primary model:           {BEDROCK_MODEL_ID}")
+    log.info(f"  Fallback model:          {OPENAI_MODEL_ID}")
+    log.info(f"  Workers:                 {BACKFILL_WORKERS}")
+    log.info(f"  Bedrock max output:      {BEDROCK_MAX_OUTPUT_TOKENS} tokens")
+    log.info(f"  OpenAI max output:       {OPENAI_MAX_OUTPUT_TOKENS} tokens")
+    log.info(f"  Single-call input limit: {SINGLE_CALL_INPUT_LIMIT:,} chars")
+    log.info(f"  Map-reduce chunk size:   {MAP_REDUCE_CHUNK_SIZE:,} chars")
+    log.info(f"  Transcript retries:      {MAX_TRANSCRIPT_RETRIES} × {RETRY_WAIT_MINUTES}min")
+    log.info(f"  Scan interval:           {SCAN_INTERVAL}s")
+    log.info(f"  Path resolution:         auto (new + old + S3 scan fallback)")
     log.info("=" * 60)
 
     try:

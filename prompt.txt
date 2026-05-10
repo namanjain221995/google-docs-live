@@ -1,6 +1,6 @@
 {
   "prompt_name": "Mock Interview Dual-Party Analysis Prompt",
-  "version": "3.0",
+  "version": "3.1",
   "description": "Comprehensive analysis of mock interview sessions using VTT transcript and Google Doc changelog. Evaluates both the Proxy Support Person and the Candidate. Final output is TWO STRICT TABLES with hard-bound action category enums.",
 
   "system_context": {
@@ -275,6 +275,79 @@
     }
   },
 
+  "STRICT_OUTPUT_FORMAT_ENFORCEMENT": {
+    "purpose": "This section locks the EXACT output shape so any LLM (Claude Haiku, Claude Sonnet, GPT-4o, GPT-4o-mini, Bedrock, Gemini, etc.) produces the same parseable result. Downstream pipelines parse this output deterministically — any deviation breaks the pipeline.",
+
+    "MANDATORY_OUTPUT_STRUCTURE": [
+      "1. Start with a single H3 markdown heading: '### Table 1: Proxy Support Performance Table'",
+      "2. Output Table 1 as a standard markdown table with EXACTLY 7 columns in this order: | Date | Salesforce Interview ID | Interview-Success Person | Meeting ID | Chance of Moving to Next Round % | Action Required | Proxy Support Action Categories |",
+      "3. Output the markdown separator row: |------|------|------|------|------|------|------|",
+      "4. Output exactly ONE data row for Table 1 (one session = one row)",
+      "5. Leave one blank line, then output: '### Table 2: Candidate Performance Table'",
+      "6. Output Table 2 as a standard markdown table with EXACTLY 6 columns in this order: | Salesforce Interview ID | Candidate Name | Meeting ID | Chance of Moving to Next Round % | Action Required | Candidate Action Categories |",
+      "7. Output the markdown separator row: |------|------|------|------|------|------|",
+      "8. Output exactly ONE data row for Table 2",
+      "9. Leave one blank line, then output the supporting detail sections under H4 headings (#### Response Speed Analysis, #### Proxy Flag Details, #### Candidate Flag Details, #### Interviewer Engagement Summary, #### Session Overview)"
+    ],
+
+    "FIELD_VALUE_FORMAT_RULES": {
+      "Date": "STRICT format YYYY-MM-DD (e.g. 2026-05-08). NO time component, NO timezone, NO datetime objects, NO 'May 8, 2026'.",
+      "Salesforce Interview ID": "STRICT format I-NNNNNN (e.g. I-025045). If not found in doc header, use the literal string 'NOT_FOUND'.",
+      "Interview-Success Person": "Real name from doc 'Edited By' field (e.g. 'abhishek.jain' or 'Vivek Parmar'). NEVER a category, score, or status word.",
+      "Meeting ID": "Numeric meeting ID as a string (e.g. '92913872799'). NO labels, NO prefixes.",
+      "Candidate Name": "Real person's full name from VTT speaker (e.g. 'Sohan Rajendra Patil'). NEVER 'CRITICAL', 'HIGH', 'LOW', 'Unknown', 'Q6 response', narrative text, or scoring words. If candidate is silent or absent, use the candidate name from doc header. If neither available, use 'NOT_FOUND'.",
+      "Chance of Moving to Next Round %": "INTEGER between 5 and 95 inclusive (e.g. 62). NO percent sign in the value, NO decimals, NO ranges like '60-70'. Just the number.",
+      "Action Required": "EXACTLY ONE of these four strings: CRITICAL | NEEDS_IMPROVEMENT | GOOD | EXCELLENT. NO other values.",
+      "Proxy Support Action Categories": "Comma-separated list of enum strings ONLY from PROXY_ACTION_CATEGORIES_ENUM. Example: 'Response Speed Based on Domain, Responses Sound Too AI-Generated'. If zero issues: 'No Action Needed — Proxy Support'.",
+      "Candidate Action Categories": "Comma-separated list of enum strings ONLY from CANDIDATE_ACTION_CATEGORIES_ENUM (any sub-category). Example: 'Answers Feel Unnatural or Scripted, Cannot Go Deeper When Asked'. If zero issues: 'No Issues Detected'."
+    },
+
+    "SUPPORTING_DETAIL_FORMAT_RULES": {
+      "Response Speed Analysis": "Use bullet list. Each bullet: '- Q: <question text first 100 chars> | asked_at: HH:MM:SS | pasted_at: HH:MM:SS | delta: N seconds | domain: <domain> | rating: OK|WARNING|SLOW'",
+      "Proxy Flag Details": "Use bullet list. Each bullet: '- <Category Name>: triggered by Version N | evidence: <1-2 sentence quote>'. Use exact category name from enum.",
+      "Candidate Flag Details": "Use bullet list. Each bullet: '- <Category Name>: VTT timestamp HH:MM:SS | evidence: <1-2 sentence quote>'. Use exact category name from enum.",
+      "Interviewer Engagement Summary": "3-5 sentences max. Start with engagement level (one of: VERY_ENGAGED | ENGAGED | NEUTRAL | DISENGAGED | DISCONNECTED). Then list signals detected with timestamps.",
+      "Session Overview": "Use bullet list. Each bullet: '- Round Type: X', '- Duration: N minutes', '- Total Questions: N', '- Total Pastes: N', '- Proxy Score: X.X/10', '- Candidate Score: X.X/10'"
+    },
+
+    "DURATION_FORMAT_RULE": "Always express duration as 'N minutes' where N is an integer (e.g. '45 minutes', '66 minutes'). Convert hours: '1 hour 6 minutes' → '66 minutes'. Convert approximations: 'Approximately 45' → '45 minutes'. Convert abbreviations: '60 mins' → '60 minutes'. NEVER use 'h', 'hr', 'mins', 'sec', 'seconds', or compound forms.",
+
+    "SCORE_FORMAT_RULE": "Always express scores as 'N/10' where N is a number (integer or one decimal place). Examples: '7/10', '5.5/10', '8.2/10'. NEVER append words like '(GOOD)' or 'EXCELLENT'. NEVER use percentages. NEVER output 'NOT_APPLICABLE' or '0/10' for technical-failure sessions — use the lowest valid integer score (1/10) instead.",
+
+    "TIMESTAMP_FORMAT_RULE": "All VTT timestamps in the supporting detail MUST be HH:MM:SS format (e.g. '00:02:30'). NEVER 'M:SS' (e.g. '2:30'), NEVER include 'VTT' or 'Timestamp' prefix in the value, NEVER use timezone-tagged times like '03:27:44 AM IST'.",
+
+    "FORBIDDEN_OUTPUT_PATTERNS": [
+      "DO NOT output 'AUDIT OUTPUT', 'PART 1', 'PART 2', 'PART 3', 'audit_metadata', 'audit_summary_card', 'role_identification', 'flat_summary', 'overall_dynamics_of_interview', 'mistake_and_risk_ledger', 'final_verdict' or any similar audit-style headers",
+      "DO NOT use ASCII box-art characters (╔ ═ ║ ╗ ╚ ╝ ╠ ╣ ⚠ ✓ ✗ ❌ ✅ 🔴 🟢) in any field",
+      "DO NOT output Unicode smart quotes (U+201C U+201D U+2018 U+2019) — use straight ASCII quotes only",
+      "DO NOT output a vertical key-value table for metadata (| Field | Value | rows). Tables MUST be horizontal: header row + separator row + data row",
+      "DO NOT output JSON, YAML, or code blocks for the main tables — markdown table syntax only",
+      "DO NOT add any preamble like 'Here is the analysis:' or 'After reviewing the session:' before Table 1",
+      "DO NOT add any postscript like 'Please let me know if...' or 'Hope this helps' after the supporting detail",
+      "DO NOT split the output into multiple parts. Single response, single set of outputs in the order specified above",
+      "DO NOT include the analysis steps, internal reasoning, or step-by-step thinking in the output",
+      "DO NOT use bold/italic formatting INSIDE table cells — markdown bold inside cells breaks downstream parsing",
+      "DO NOT wrap categories in quotes inside the table cells — output them as plain comma-separated text",
+      "DO NOT add explanatory parentheticals next to enum values like 'Response Speed Based on Domain (slow)' — emit the enum string only"
+    ],
+
+    "VALIDATION_CHECKLIST_BEFORE_RESPONDING": [
+      "[ ] Output starts with '### Table 1:' (no preamble, no other content first)",
+      "[ ] Table 1 has exactly 7 columns and exactly 1 data row",
+      "[ ] Table 2 has exactly 6 columns and exactly 1 data row",
+      "[ ] Date is YYYY-MM-DD with no time",
+      "[ ] Chance is an integer 5-95 with no % sign",
+      "[ ] Candidate Name is a real human name (not a category, score, or narrative)",
+      "[ ] Action Required is one of: CRITICAL | NEEDS_IMPROVEMENT | GOOD | EXCELLENT",
+      "[ ] All enum strings in categories columns are exact matches from the enums",
+      "[ ] Same Chance value appears in both tables",
+      "[ ] Supporting detail uses bullets under H4 headings",
+      "[ ] No box-art, no smart quotes, no JSON, no PART 1/2/3"
+    ],
+
+    "EXAMPLE_FULL_OUTPUT": "### Table 1: Proxy Support Performance Table\n\n| Date | Salesforce Interview ID | Interview-Success Person | Meeting ID | Chance of Moving to Next Round % | Action Required | Proxy Support Action Categories |\n|------|------|------|------|------|------|------|\n| 2026-05-08 | I-026137 | abhishek.jain | 92913872799 | 62 | NEEDS_IMPROVEMENT | Response Speed Based on Domain, Responses Sound Too AI-Generated, Reduce Verbosity |\n\n### Table 2: Candidate Performance Table\n\n| Salesforce Interview ID | Candidate Name | Meeting ID | Chance of Moving to Next Round % | Action Required | Candidate Action Categories |\n|------|------|------|------|------|------|\n| I-026137 | Sohan Rajendra Patil | 92913872799 | 62 | NEEDS_IMPROVEMENT | Answers Feel Unnatural or Scripted, Delayed Responses or Long Silence, Cannot Go Deeper When Asked |\n\n#### Response Speed Analysis\n- Q: Tell me about yourself | asked_at: 00:00:30 | pasted_at: 00:01:45 | delta: 75 seconds | domain: behavioral | rating: WARNING\n- Q: Walk me through your OpenAI work | asked_at: 00:05:10 | pasted_at: 00:06:20 | delta: 70 seconds | domain: technical | rating: OK\n\n#### Proxy Flag Details\n- Response Speed Based on Domain: triggered by Version 3 | evidence: Paste landed 75s after question, exceeding 60s threshold for behavioral domain.\n- Responses Sound Too AI-Generated: triggered by Version 5 | evidence: Answer opens with 'Certainly! Let me walk you through' which signals AI tone.\n\n#### Candidate Flag Details\n- Answers Feel Unnatural or Scripted: VTT timestamp 00:02:30 | evidence: Multiple points where responses seem rehearsed or overly structured.\n- Delayed Responses or Long Silence: VTT timestamp 00:08:20 | evidence: Notable pause of approximately 8 seconds before responding.\n\n#### Interviewer Engagement Summary\nEngagement level: ENGAGED. Interviewer asked two follow-up questions at 00:06:45 and 00:14:20. Discussed next steps at 00:35:10. Maintained neutral-positive tone throughout.\n\n#### Session Overview\n- Round Type: Introduction_Call\n- Duration: 45 minutes\n- Total Questions: 8\n- Total Pastes: 7\n- Proxy Score: 7.2/10\n- Candidate Score: 6.5/10"
+  },
+
   "output_format": {
     "CRITICAL_INSTRUCTION": "The FINAL OUTPUT must be EXACTLY two tables in this structure. No other format is acceptable. Produce the tables after your internal analysis. Do not output the analysis steps — only the two tables and the supporting detail sections below them.",
 
@@ -400,6 +473,7 @@
     "RULE 11 — TABLE FIRST: Output Table 1 and Table 2 BEFORE any supporting detail. The tables are the primary deliverable.",
     "RULE 12 — NO INTERNAL STEPS IN OUTPUT: Do not output intermediate analysis steps. Output only: Table 1, Table 2, Supporting Detail sections.",
     "RULE 13 — N/A FOR NON-APPLICABLE CATEGORIES: If a category is not applicable to the round type, exclude it entirely from the Action Categories list — do not write 'N/A' inside the categories column.",
-    "RULE 14 — CLAMP CHANCE: Chance of Moving to Next Round % must always be between 5 and 95 inclusive."
+    "RULE 14 — CLAMP CHANCE: Chance of Moving to Next Round % must always be between 5 and 95 inclusive.",
+    "RULE 15 — STRICT OUTPUT FORMAT: Follow STRICT_OUTPUT_FORMAT_ENFORCEMENT exactly. The output must be parseable identically regardless of which LLM (Claude Haiku, Claude Sonnet, GPT-4o, GPT-4o-mini, Bedrock, Gemini) is generating it. Any deviation breaks downstream pipelines."
   ]
 }

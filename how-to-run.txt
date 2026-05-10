@@ -9,6 +9,9 @@ sudo systemctl stop llm-processor-worker
 
 python3.11 cleanup_llm.py
 
+aws s3 rm s3://zoom-automation-bucket/temp/live-doc-history/ \
+  --recursive --exclude "*" --include "*/Month-5/*/sheets-done.json"
+
 sudo systemctl restart meeting-start-worker doc-finalizer-worker google-change-worker
 
 # Check DB for tracked meetings
