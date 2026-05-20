@@ -159,33 +159,41 @@ def build_temp_prefix(meeting_id: str, now_utc: datetime) -> str:
     return f"temp/live-doc-history/{year}/{month}/{date_str}/{meeting_id}"
 
 # ── S3: FIND FINAL PATH ──
+DEPARTMENTS = [
+    "Interview-Success", "Training", "Customer-Success", "Marketing",
+    "COO", "CEO", "Executive-Assistant", "Techsphere", "HR",
+]
+
+
 def find_final_s3_prefix_early(meeting_id):
-    DEPARTMENTS = {
-        "Interview-Success": 4,
-        "Training":          2,
-        "Customer-Success":  2,
-        "Marketing":         2,
-    }
+    """
+    Find the final recording folder for this meeting.
+
+    The recording Lambda places meeting_id as the LAST folder in the path
+    (before the MP4/M4A/TRANSCRIPT/CHAT file-type folder) for EVERY
+    department, so the final prefix is simply everything up to and
+    including the meeting_id segment — no per-department offset needed.
+    """
     paginator  = s3.get_paginator("list_objects_v2")
     search_str = f"/{meeting_id}/"
-    for dept, offset in DEPARTMENTS.items():
+    for dept in DEPARTMENTS:
         try:
             found = set()
             for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=f"{dept}/"):
                 for obj in page.get("Contents", []):
                     key = obj["Key"]
-                    if search_str in key:
-                        parts = key.split("/")
-                        try:
-                            idx = parts.index(meeting_id)
-                            end = idx + offset + 1
-                            if len(parts) > end:
-                                found.add("/".join(parts[:end]))
-                        except ValueError:
-                            continue
+                    if search_str not in key:
+                        continue
+                    parts = key.split("/")
+                    try:
+                        idx = parts.index(meeting_id)
+                    except ValueError:
+                        continue
+                    if len(parts) > idx + 1:
+                        found.add("/".join(parts[:idx + 1]))
             if found:
                 result = sorted(found)[0]
-                log.info(f"Found final S3 prefix for meeting_id={meeting_id}: {result}")
+                log.info(f"Found final S3 prefix [{dept}] for meeting_id={meeting_id}: {result}")
                 return result
         except Exception as e:
             log.warning(f"S3 search error in {dept}: {e}")

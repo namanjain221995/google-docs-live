@@ -2099,24 +2099,35 @@ def extract_is_person(bp: str) -> str:
         return _clean(parts[1])
     return ""
 
+_MONTH_NAMES = ["January", "February", "March", "April", "May", "June",
+                "July", "August", "September", "October", "November", "December"]
+_MONTH_LOOKUP = {m.lower(): m for m in _MONTH_NAMES}
+
 def extract_year_month(bp: str) -> tuple:
-    """Extract year and month name from base_prefix."""
+    """
+    Extract (year, month_name) from a base_prefix.
+    Handles BOTH path styles:
+      - real month name segment:  .../2026/May/...      (Interview-Success / recording Lambda)
+      - Month-N segment:          .../2026/Month-5/...  (temp/live-doc-history paths)
+    Returns ("", "Unknown") when nothing matches.
+    """
     parts = bp.split("/")
-    year = month_num = ""
-    for p in parts:
-        if p.isdigit() and len(p) == 4:
-            year = p
-        elif p.startswith("Month-"):
+    year = ""
+    month_name = ""
+    for seg in parts:
+        seg = seg.strip()
+        if seg.isdigit() and len(seg) == 4:
+            year = seg
+        elif seg.lower() in _MONTH_LOOKUP:
+            month_name = _MONTH_LOOKUP[seg.lower()]
+        elif seg.startswith("Month-"):
             try:
-                month_num = int(p.replace("Month-", ""))
+                n = int(seg.replace("Month-", ""))
+                if 1 <= n <= 12:
+                    month_name = _MONTH_NAMES[n - 1]
             except Exception:
                 pass
-    names = ["", "January", "February", "March", "April", "May", "June",
-             "July", "August", "September", "October", "November", "December"]
-    mn = (names[month_num]
-          if isinstance(month_num, int) and 0 < month_num <= 12
-          else "Unknown")
-    return year, mn
+    return year, (month_name or "Unknown")
 
 # ── Google Drive cache + race-safe create ─────────────────────────────────────
 _dc    = {}
@@ -2754,7 +2765,7 @@ def process(item: dict) -> str:
         # Track failures with retry counter — give up after 3 attempts
         fail_key = f"{pfx}/llm-parse-failed.json"
         try:
-            resp = s3.get_object(Bucket=BUCKET, Key=fail_key)
+            resp = s3c.get_object(Bucket=S3_BUCKET, Key=fail_key)
             fail_data = json.loads(resp["Body"].read().decode("utf-8"))
             attempts = int(fail_data.get("attempts", 0)) + 1
         except Exception:

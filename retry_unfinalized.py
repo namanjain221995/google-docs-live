@@ -29,12 +29,10 @@ DB_PORT     = int(os.environ.get("DB_PORT", "5432"))
 IST_OFFSET  = timedelta(hours=5, minutes=30)
 MAX_WORKERS = 20
 
-DEPARTMENTS = {
-    "Interview-Success": 4,
-    "Training":          2,
-    "Customer-Success":  2,
-    "Marketing":         2,
-}
+DEPARTMENTS = [
+    "Interview-Success", "Training", "Customer-Success", "Marketing",
+    "COO", "CEO", "Executive-Assistant", "Techsphere", "HR",
+]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -108,23 +106,25 @@ def find_unfinalized_meetings() -> list[dict]:
 
 
 def find_final_s3_prefix(meeting_id: str) -> str | None:
+    """meeting_id is the LAST folder of the recording path for every
+    department, so the prefix is everything up to and including it."""
     paginator  = s3.get_paginator("list_objects_v2")
     search_str = f"/{meeting_id}/"
-    for dept, offset in DEPARTMENTS.items():
+    for dept in DEPARTMENTS:
         found = set()
         try:
             for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=f"{dept}/"):
                 for obj in page.get("Contents", []):
                     key = obj["Key"]
-                    if search_str in key:
-                        parts = key.split("/")
-                        try:
-                            idx = parts.index(meeting_id)
-                            end = idx + offset + 1
-                            if len(parts) > end:
-                                found.add("/".join(parts[:end]))
-                        except ValueError:
-                            continue
+                    if search_str not in key:
+                        continue
+                    parts = key.split("/")
+                    try:
+                        idx = parts.index(meeting_id)
+                    except ValueError:
+                        continue
+                    if len(parts) > idx + 1:
+                        found.add("/".join(parts[:idx + 1]))
             if found:
                 return sorted(found)[0]
         except Exception as e:

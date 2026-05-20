@@ -218,35 +218,38 @@ def strip_current_final_block(doc_txt):
     return doc_txt[:idx] if idx != -1 else doc_txt
 
 # ── FIND FINAL S3 PATH ──
+DEPARTMENTS = [
+    "Interview-Success", "Training", "Customer-Success", "Marketing",
+    "COO", "CEO", "Executive-Assistant", "Techsphere", "HR",
+]
+
+
 def find_final_s3_prefix(meeting_id):
     """
     Search S3 for the final recording folder containing this meeting_id.
-    Searches all departments.
+
+    meeting_id is always the LAST folder in the recording path (before the
+    file-type folder) for every department, so the final prefix is simply
+    everything up to and including the meeting_id segment.
     """
-    DEPARTMENTS = {
-        "Interview-Success": 4,
-        "Training":          2,
-        "Customer-Success":  2,
-        "Marketing":         2,
-    }
     paginator  = s3.get_paginator("list_objects_v2")
     search_str = f"/{meeting_id}/"
 
-    for dept, offset in DEPARTMENTS.items():
+    for dept in DEPARTMENTS:
         found = set()
         try:
             for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=f"{dept}/"):
                 for obj in page.get("Contents", []):
                     key = obj["Key"]
-                    if search_str in key:
-                        parts = key.split("/")
-                        try:
-                            idx = parts.index(meeting_id)
-                            end = idx + offset + 1
-                            if len(parts) > end:
-                                found.add("/".join(parts[:end]))
-                        except ValueError:
-                            continue
+                    if search_str not in key:
+                        continue
+                    parts = key.split("/")
+                    try:
+                        idx = parts.index(meeting_id)
+                    except ValueError:
+                        continue
+                    if len(parts) > idx + 1:
+                        found.add("/".join(parts[:idx + 1]))
             if found:
                 result = sorted(found)[0]
                 log.info(f"Found final S3 prefix [{dept}] for meeting_id={meeting_id}: {result}")
@@ -257,8 +260,22 @@ def find_final_s3_prefix(meeting_id):
     return None
 
 # ── FINALIZE DOC TO FINAL PATH ──
+def _get_temp_prefix(meeting_id):
+    """Resolve the real (date-organised) temp prefix from the DB.
+    Falls back to the legacy flat layout if the row is missing."""
+    try:
+        row = db_execute(
+            "SELECT temp_s3_prefix FROM tracked_docs WHERE meeting_id=%s LIMIT 1",
+            (meeting_id,), fetch="one")
+        if row and row.get("temp_s3_prefix"):
+            return row["temp_s3_prefix"].rstrip("/")
+    except Exception as e:
+        log.warning(f"temp_s3_prefix lookup failed for meeting_id={meeting_id}: {e}")
+    return f"temp/live-doc-history/{meeting_id}"  # legacy fallback
+
+
 def finalize_to_final_path(meeting_id, final_prefix):
-    temp_prefix = f"temp/live-doc-history/{meeting_id}"
+    temp_prefix = _get_temp_prefix(meeting_id)
     docs_prefix = f"{final_prefix}/docs"
     src_key     = f"{temp_prefix}/doc.txt"
     dst_key     = f"{docs_prefix}/doc.txt"

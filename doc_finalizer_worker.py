@@ -49,29 +49,15 @@ DB_PORT             = int(os.environ.get("DB_PORT", "5432"))
 WAIT_BEFORE_SEARCH  = int(os.environ.get("WAIT_BEFORE_SEARCH_SECONDS", "60"))
 IST_OFFSET          = timedelta(hours=5, minutes=30)
 
-# ── Department offset table ────────────────────────────────────────────────────
-#
-#  offset = how many parts AFTER the meeting_id index to include in the prefix
-#
-#  Interview-Success NEW structure:
-#    parts = [dept, host, year, month, candidate, company, date, round, meeting_id, filetype, file]
-#    meeting_id is at parts[8]
-#    we want prefix = parts[:9]
-#    end = 8 + 0 + 1 = 9  →  offset = 0  ✅
-#
-#  Training / Customer-Success / Marketing (unchanged):
-#    parts = [dept, host, year, month, candidate, meeting_id, date, time, filetype, file]
-#    meeting_id is at parts[5]
-#    we want prefix = parts[:8]
-#    end = 5 + 2 + 1 = 8  →  offset = 2  ✅
-#
-# ─────────────────────────────────────────────────────────────────────────────
-DEPARTMENTS = {
-    "Interview-Success": 0,   # ✅ UPDATED: Meeting_ID is now the last folder in path
-    "Training":          2,   # unchanged
-    "Customer-Success":  2,   # unchanged
-    "Marketing":         2,   # unchanged
-}
+# ── Departments ──
+#  The recording Lambda places meeting_id as the LAST folder of the
+#  path (just before the MP4/M4A/TRANSCRIPT/CHAT file-type folder) for
+#  EVERY department. The final prefix is therefore everything up to and
+#  including the meeting_id segment — no per-department offset needed.
+DEPARTMENTS = [
+    "Interview-Success", "Training", "Customer-Success", "Marketing",
+    "COO", "CEO", "Executive-Assistant", "Techsphere", "HR",
+]
 
 os.makedirs("/home/ec2-user/google-docs-live/logs", exist_ok=True)
 logging.basicConfig(
@@ -184,7 +170,7 @@ def find_final_s3_prefix(meeting_id: str) -> str | None:
     paginator  = s3.get_paginator("list_objects_v2")
     search_str = f"/{meeting_id}/"
 
-    for dept, offset in DEPARTMENTS.items():
+    for dept in DEPARTMENTS:
         found = set()
         try:
             for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=f"{dept}/"):
@@ -195,18 +181,16 @@ def find_final_s3_prefix(meeting_id: str) -> str | None:
                     parts = key.split("/")
                     try:
                         idx = parts.index(meeting_id)
-                        end = idx + offset + 1   # +1 to include meeting_id itself
-                        if len(parts) > end:
-                            found.add("/".join(parts[:end]))
                     except ValueError:
                         continue
+                    if len(parts) > idx + 1:
+                        found.add("/".join(parts[:idx + 1]))
 
             if found:
                 result = sorted(found)[0]
                 log.info(
                     f"Found final S3 prefix [{dept}] "
-                    f"for meeting_id={meeting_id}: {result} "
-                    f"(offset={offset})"
+                    f"for meeting_id={meeting_id}: {result}"
                 )
                 return result
 
