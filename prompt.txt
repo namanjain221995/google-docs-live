@@ -280,7 +280,7 @@
 
     "MANDATORY_OUTPUT_STRUCTURE": [
       "1. Start with a single H3 markdown heading: '### Table 1: Proxy Support Performance Table'",
-      "2. Output Table 1 as a standard markdown table with EXACTLY 7 columns in this order: | Date | Salesforce Interview ID | Interview-Success Person | Meeting ID | Chance of Moving to Next Round % | Action Required | Proxy Support Action Categories |",
+      "2. Output Table 1 as a standard markdown table with EXACTLY 7 columns in this order: | Date | Salesforce Interview ID | Interview-Success Person | Meeting ID | Chance of Moving to Next Round % | Action Required | Interview-Success Action Categories |",
       "3. Output the markdown separator row: |------|------|------|------|------|------|------|",
       "4. Output exactly ONE data row for Table 1 (one session = one row)",
       "5. Leave one blank line, then output: '### Table 2: Candidate Performance Table'",
@@ -298,7 +298,7 @@
       "Candidate Name": "Real person's full name from VTT speaker (e.g. 'Sohan Rajendra Patil'). NEVER 'CRITICAL', 'HIGH', 'LOW', 'Unknown', 'Q6 response', narrative text, or scoring words. If candidate is silent or absent, use the candidate name from doc header. If neither available, use 'NOT_FOUND'.",
       "Chance of Moving to Next Round %": "INTEGER between 5 and 95 inclusive (e.g. 62). NO percent sign in the value, NO decimals, NO ranges like '60-70'. Just the number.",
       "Action Required": "EXACTLY ONE of these four strings: CRITICAL | NEEDS_IMPROVEMENT | GOOD | EXCELLENT. NO other values.",
-      "Proxy Support Action Categories": "Comma-separated list of enum strings ONLY from PROXY_ACTION_CATEGORIES_ENUM. Example: 'Response Speed Based on Domain, Responses Sound Too AI-Generated'. If zero issues: 'No Action Needed — Proxy Support'.",
+      "Interview-Success Action Categories": "Comma-separated list of enum strings ONLY from PROXY_ACTION_CATEGORIES_ENUM. Example: 'Response Speed Based on Domain, Responses Sound Too AI-Generated'. If zero issues: 'No Action Needed — Proxy Support'.",
       "Candidate Action Categories": "Comma-separated list of enum strings ONLY from CANDIDATE_ACTION_CATEGORIES_ENUM (any sub-category). Example: 'Answers Feel Unnatural or Scripted, Cannot Go Deeper When Asked'. If zero issues: 'No Issues Detected'."
     },
 
@@ -345,7 +345,7 @@
       "[ ] No box-art, no smart quotes, no JSON, no PART 1/2/3"
     ],
 
-    "EXAMPLE_FULL_OUTPUT": "### Table 1: Proxy Support Performance Table\n\n| Date | Salesforce Interview ID | Interview-Success Person | Meeting ID | Chance of Moving to Next Round % | Action Required | Proxy Support Action Categories |\n|------|------|------|------|------|------|------|\n| 2026-05-08 | I-026137 | abhishek.jain | 92913872799 | 62 | NEEDS_IMPROVEMENT | Response Speed Based on Domain, Responses Sound Too AI-Generated, Reduce Verbosity |\n\n### Table 2: Candidate Performance Table\n\n| Salesforce Interview ID | Candidate Name | Meeting ID | Chance of Moving to Next Round % | Action Required | Candidate Action Categories |\n|------|------|------|------|------|------|\n| I-026137 | Sohan Rajendra Patil | 92913872799 | 62 | NEEDS_IMPROVEMENT | Answers Feel Unnatural or Scripted, Delayed Responses or Long Silence, Cannot Go Deeper When Asked |\n\n#### Response Speed Analysis\n- Q: Tell me about yourself | asked_at: 00:00:30 | pasted_at: 00:01:45 | delta: 75 seconds | domain: behavioral | rating: WARNING\n- Q: Walk me through your OpenAI work | asked_at: 00:05:10 | pasted_at: 00:06:20 | delta: 70 seconds | domain: technical | rating: OK\n\n#### Proxy Flag Details\n- Response Speed Based on Domain: triggered by Version 3 | evidence: Paste landed 75s after question, exceeding 60s threshold for behavioral domain.\n- Responses Sound Too AI-Generated: triggered by Version 5 | evidence: Answer opens with 'Certainly! Let me walk you through' which signals AI tone.\n\n#### Candidate Flag Details\n- Answers Feel Unnatural or Scripted: VTT timestamp 00:02:30 | evidence: Multiple points where responses seem rehearsed or overly structured.\n- Delayed Responses or Long Silence: VTT timestamp 00:08:20 | evidence: Notable pause of approximately 8 seconds before responding.\n\n#### Interviewer Engagement Summary\nEngagement level: ENGAGED. Interviewer asked two follow-up questions at 00:06:45 and 00:14:20. Discussed next steps at 00:35:10. Maintained neutral-positive tone throughout.\n\n#### Session Overview\n- Round Type: Introduction_Call\n- Duration: 45 minutes\n- Total Questions: 8\n- Total Pastes: 7\n- Proxy Score: 7.2/10\n- Candidate Score: 6.5/10"
+    "EXAMPLE_FULL_OUTPUT": "### Table 1: Proxy Support Performance Table\n\n| Date | Salesforce Interview ID | Interview-Success Person | Meeting ID | Chance of Moving to Next Round % | Action Required | Interview-Success Action Categories |\n|------|------|------|------|------|------|------|\n| 2026-05-08 | I-026137 | abhishek.jain | 92913872799 | 62 | NEEDS_IMPROVEMENT | Response Speed Based on Domain, Responses Sound Too AI-Generated, Reduce Verbosity |\n\n### Table 2: Candidate Performance Table\n\n| Salesforce Interview ID | Candidate Name | Meeting ID | Chance of Moving to Next Round % | Action Required | Candidate Action Categories |\n|------|------|------|------|------|------|\n| I-026137 | Sohan Rajendra Patil | 92913872799 | 62 | NEEDS_IMPROVEMENT | Answers Feel Unnatural or Scripted, Delayed Responses or Long Silence, Cannot Go Deeper When Asked |\n\n#### Response Speed Analysis\n- Q: Tell me about yourself | asked_at: 00:00:30 | pasted_at: 00:01:45 | delta: 75 seconds | domain: behavioral | rating: WARNING\n- Q: Walk me through your OpenAI work | asked_at: 00:05:10 | pasted_at: 00:06:20 | delta: 70 seconds | domain: technical | rating: OK\n\n#### Proxy Flag Details\n- Response Speed Based on Domain: triggered by Version 3 | evidence: Paste landed 75s after question, exceeding 60s threshold for behavioral domain.\n- Responses Sound Too AI-Generated: triggered by Version 5 | evidence: Answer opens with 'Certainly! Let me walk you through' which signals AI tone.\n\n#### Candidate Flag Details\n- Answers Feel Unnatural or Scripted: VTT timestamp 00:02:30 | evidence: Multiple points where responses seem rehearsed or overly structured.\n- Delayed Responses or Long Silence: VTT timestamp 00:08:20 | evidence: Notable pause of approximately 8 seconds before responding.\n\n#### Interviewer Engagement Summary\nEngagement level: ENGAGED. Interviewer asked two follow-up questions at 00:06:45 and 00:14:20. Discussed next steps at 00:35:10. Maintained neutral-positive tone throughout.\n\n#### Session Overview\n- Round Type: Introduction_Call\n- Duration: 45 minutes\n- Total Questions: 8\n- Total Pastes: 7\n- Proxy Score: 7.2/10\n- Candidate Score: 6.5/10"
   },
 
   "output_format": {
@@ -379,7 +379,7 @@
           "source": "step_5_scoring.action_required.proxy — one of: CRITICAL | NEEDS_IMPROVEMENT | GOOD | EXCELLENT"
         },
         {
-          "column": "Proxy Support Action Categories",
+          "column": "Interview-Success Action Categories",
           "source": "step_6_category_mapping output for proxy — comma-separated list of strings STRICTLY from PROXY_ACTION_CATEGORIES_ENUM only. No other values allowed."
         }
       ],
@@ -390,7 +390,7 @@
         "Meeting ID": "91339609150",
         "Chance of Moving to Next Round %": 62,
         "Action Required": "NEEDS_IMPROVEMENT",
-        "Proxy Support Action Categories": "Response Speed Based on Domain, Responses Sound Too AI-Generated, Document Formatting Appears Too Quickly"
+        "Interview-Success Action Categories": "Response Speed Based on Domain, Responses Sound Too AI-Generated, Document Formatting Appears Too Quickly"
       }
     },
 
@@ -460,7 +460,7 @@
   },
 
   "analysis_rules": [
-    "RULE 1 — ENUM HARD BOUND: The Proxy Support Action Categories column MUST contain ONLY strings from PROXY_ACTION_CATEGORIES_ENUM. Zero exceptions. Zero paraphrasing.",
+    "RULE 1 — ENUM HARD BOUND: The Interview-Success Action Categories column MUST contain ONLY strings from PROXY_ACTION_CATEGORIES_ENUM. Zero exceptions. Zero paraphrasing.",
     "RULE 2 — ENUM HARD BOUND: The Candidate Action Categories column MUST contain ONLY strings from CANDIDATE_ACTION_CATEGORIES_ENUM sub-items. Zero exceptions. Zero paraphrasing.",
     "RULE 3 — SAME CHANCE VALUE: Both tables show the IDENTICAL 'Chance of Moving to Next Round %' integer for the same session.",
     "RULE 4 — NO INVENTED DATA: Never invent metadata. If a doc header field is missing, write 'NOT_FOUND' in that column.",

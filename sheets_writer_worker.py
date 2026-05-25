@@ -738,7 +738,8 @@ def _parse_markdown_tables(text, log_ref=None):
     _HEADER_CELLS = {
         "date", "salesforce interview id", "interview-success person",
         "meeting id", "chance of moving to next round %", "chance %",
-        "action required", "proxy support action categories",
+        "action required", "interview-success action categories",
+        "proxy support action categories",
         "candidate action categories", "candidate name", "sf id",
         "is person", "categories", "chance", "action",
     }
@@ -826,6 +827,7 @@ def _parse_markdown_tables(text, log_ref=None):
     # ── Try all strategies for PROXY table ─────────────────────────────────
     proxy_cells = (
         find_by_title("PROXY") or
+        find_by_column_header(["interview-success person", "interview-success action categories"]) or
         find_by_column_header(["interview-success person", "proxy support action categories"]) or
         find_by_column_header(["interview-success person", "proxy support action required"])
     )
@@ -849,7 +851,7 @@ def _parse_markdown_tables(text, log_ref=None):
             "proxy_action":   ["proxy support action required"],
             "cand_action":    ["candidate action required"],
             "cac":            ["candidate action categories"],
-            "pac":            ["proxy support action categories"],
+            "pac":            ["interview-success action categories", "proxy support action categories"],
             "candidate_name": ["candidate name"],
         })
 
@@ -1449,7 +1451,8 @@ def parse_strict_v31(text: str) -> dict:
             elif "action required" in kl or kl == "action":
                 if not result["proxy_support_action_required"]:
                     result["proxy_support_action_required"] = v.strip().upper().replace(" ", "_")
-            elif "proxy support action categor" in kl or "proxy categor" in kl:
+            elif ("interview-success action categor" in kl
+                  or "proxy support action categor" in kl or "proxy categor" in kl):
                 result["proxy_support_action_categories"] = v.strip()
 
     # ── Parse Table 2 (Candidate Performance) ─────────────────────────────────
@@ -2240,14 +2243,14 @@ C_HDR = [
 I_HDR = [
     "Date", "Salesforce Interview ID", "Interview-Success Person", "Meeting ID",
     "Chance of Moving to Next Round %", "Action Required",
-    "Proxy Support Action Categories",
+    "Interview-Success Action Categories",
 ]
 D_HDR = [
     "Date", "Salesforce Interview ID", "Candidate Name",
     "Interview-Success Person", "Meeting ID",
     "Chance of Moving to Next Round %",
     "Candidate Action Required", "Proxy Support Action Required",
-    "Candidate Action Categories", "Proxy Support Action Categories",
+    "Candidate Action Categories", "Interview-Success Action Categories",
     "Candidate Score", "Proxy Score", "Round Type",
     "Duration", "Total Questions",
     "Candidate Evidence", "Proxy Evidence", "Questions",

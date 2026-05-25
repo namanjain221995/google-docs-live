@@ -73,3 +73,29 @@ SyslogIdentifier=google-watch-manager
 
 [Install]
 WantedBy=multi-user.target
+
+
+# ============================================================
+# FILE: services/sheet-copy-worker.service
+# Copy to: /etc/systemd/system/sheet-copy-worker.service
+# Mirrors master month-sheets (Candidate + Interview-Success tabs)
+# into the "Interview Success copy" folder as two separate spreadsheets.
+# ============================================================
+[Unit]
+Description=Sheet Copy Worker — mirrors master month-sheets into 'Interview Success copy'
+After=network.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/google-docs-live
+EnvironmentFile=/home/ec2-user/google-docs-live/env
+ExecStart=/usr/bin/python3.11 /home/ec2-user/google-docs-live/sheet_copy_worker.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sheet-copy-worker
+
+[Install]
+WantedBy=multi-user.target

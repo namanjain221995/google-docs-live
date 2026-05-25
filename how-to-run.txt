@@ -24,3 +24,32 @@ PGPASSWORD='DocHistory2026' psql -U postgres -h 127.0.0.1 -d dochistory \
 
 # Check S3 temp area
 aws s3 ls s3://zoom-automation-bucket/temp/live-doc-history/ --recursive
+
+
+# ============================================================
+# sheet_copy_worker — mirror master month-sheets → "Interview Success copy"
+# ============================================================
+# Source: 2026_Shared_Drive/Interview Success/<year>/<month>/<Month>_<Year>
+#         tabs "Candidate" + "Interview-Success"
+# Dest:   2026_Shared_Drive/Interview Success copy/<year>/<month>/Candidate
+#         2026_Shared_Drive/Interview Success copy/<year>/<month>/Interview-Success
+# 10 workers (5 Candidate + 5 Interview-Success). Mirrors live edits/adds/deletes.
+# OpenAI (gpt-5-nano) = advisory schema validation only; copy is deterministic.
+
+cd /home/ec2-user/google-docs-live
+source env
+
+# 1) Safe preview — discover what would be copied, no writes:
+python3.11 sheet_copy_worker.py --dry-run --once
+
+# 2) Real one-shot sync of a single month (good first real test):
+python3.11 sheet_copy_worker.py --once --year 2026 --month May
+
+# 3) Real one-shot of everything, OpenAI off (fastest check):
+python3.11 sheet_copy_worker.py --once --no-openai
+
+# 4) Install + run as a service (continuous live mirror every 120s):
+sudo cp services/sheet-copy-worker.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now sheet-copy-worker
+sudo journalctl -u sheet-copy-worker -f
