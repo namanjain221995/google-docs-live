@@ -105,13 +105,28 @@ def find_unfinalized_meetings() -> list[dict]:
     return unfinalized
 
 
-def find_final_s3_prefix(meeting_id: str) -> str | None:
+OWN_SUBFOLDERS = ("docs", "llm")  # written by us, not by the recording Lambda
+
+
+def get_tracking_started(temp_prefix: str) -> datetime | None:
+    """initialized_at from the temp state.json (when this meeting's tracking began)."""
+    try:
+        obj   = s3.get_object(Bucket=S3_BUCKET, Key=f"{temp_prefix}/state.json")
+        state = json.loads(obj["Body"].read().decode("utf-8"))
+        return datetime.fromisoformat(state["initialized_at"])
+    except Exception:
+        return None
+
+
+def find_final_s3_prefix(meeting_id: str, not_before: datetime | None = None) -> str | None:
     """meeting_id is the LAST folder of the recording path for every
-    department, so the prefix is everything up to and including it."""
+    department, so the prefix is everything up to and including it.
+    For a reused meeting_id, only recording folders uploaded at/after
+    not_before qualify and the newest wins (never an older session's folder)."""
     paginator  = s3.get_paginator("list_objects_v2")
     search_str = f"/{meeting_id}/"
     for dept in DEPARTMENTS:
-        found = set()
+        found = {}  # prefix -> newest recording-file LastModified
         try:
             for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=f"{dept}/"):
                 for obj in page.get("Contents", []):
@@ -123,10 +138,15 @@ def find_final_s3_prefix(meeting_id: str) -> str | None:
                         idx = parts.index(meeting_id)
                     except ValueError:
                         continue
-                    if len(parts) > idx + 1:
-                        found.add("/".join(parts[:idx + 1]))
+                    if len(parts) > idx + 1 and parts[idx + 1] not in OWN_SUBFOLDERS:
+                        pfx = "/".join(parts[:idx + 1])
+                        lm  = obj["LastModified"]
+                        if pfx not in found or lm > found[pfx]:
+                            found[pfx] = lm
+            if not_before:
+                found = {p: lm for p, lm in found.items() if lm >= not_before}
             if found:
-                return sorted(found)[0]
+                return max(found, key=found.get)
         except Exception as e:
             log.error(f"S3 search error in {dept}: {e}")
     return None
@@ -205,7 +225,8 @@ def process_one(item: dict) -> str:
     meeting_id  = item["meeting_id"]
     temp_prefix = item["prefix"]
 
-    final_prefix = find_final_s3_prefix(meeting_id)
+    started      = get_tracking_started(temp_prefix)
+    final_prefix = find_final_s3_prefix(meeting_id, not_before=started)
     if not final_prefix:
         return f"SKIP  {meeting_id} — recording not in S3 yet"
 

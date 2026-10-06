@@ -156,22 +156,36 @@ def find_temp_prefix_from_s3(meeting_id: str) -> str | None:
     return None
 
 
-def find_final_s3_prefix(meeting_id: str) -> str | None:
+OWN_SUBFOLDERS = ("docs", "llm")  # written by us, not by the recording Lambda
+
+
+def get_tracking_started(temp_prefix: str) -> datetime | None:
+    """initialized_at from the temp state.json (when this meeting's tracking began)."""
+    try:
+        obj   = s3.get_object(Bucket=S3_BUCKET, Key=f"{temp_prefix}/state.json")
+        state = json.loads(obj["Body"].read().decode("utf-8"))
+        return datetime.fromisoformat(state["initialized_at"])
+    except Exception as e:
+        log.warning(f"No tracking start time in {temp_prefix}/state.json: {e}")
+        return None
+
+
+def find_final_s3_prefix(meeting_id: str, not_before: datetime | None = None) -> str | None:
     """
     Search S3 across all departments for the final storage prefix
-    matching this meeting_id.
+    matching this meeting_id: everything up to and including the
+    meeting_id folder (.../MeetingID/).
 
-    Uses per-department offset to build correct prefix depth:
-      Interview-Success → offset=0 → prefix ends AT meeting_id folder
-        NEW path: .../Candidate/Company/Date/Round/MeetingID/
-      Training etc.     → offset=2 → prefix ends 2 folders after meeting_id
-        path: .../Candidate/MeetingID/Date/Time/
+    A reused meeting_id (recurring meeting) has one recording folder per
+    session. Only folders whose recording files were uploaded at/after
+    not_before (this session's tracking start) qualify, and the newest wins,
+    so docs never land in — or overwrite — an older session's folder.
     """
     paginator  = s3.get_paginator("list_objects_v2")
     search_str = f"/{meeting_id}/"
 
     for dept in DEPARTMENTS:
-        found = set()
+        found = {}  # prefix -> newest recording-file LastModified
         try:
             for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=f"{dept}/"):
                 for obj in page.get("Contents", []):
@@ -183,11 +197,21 @@ def find_final_s3_prefix(meeting_id: str) -> str | None:
                         idx = parts.index(meeting_id)
                     except ValueError:
                         continue
-                    if len(parts) > idx + 1:
-                        found.add("/".join(parts[:idx + 1]))
+                    if len(parts) > idx + 1 and parts[idx + 1] not in OWN_SUBFOLDERS:
+                        pfx = "/".join(parts[:idx + 1])
+                        lm  = obj["LastModified"]
+                        if pfx not in found or lm > found[pfx]:
+                            found[pfx] = lm
 
+            if not_before:
+                found = {p: lm for p, lm in found.items() if lm >= not_before}
             if found:
-                result = sorted(found)[0]
+                result = max(found, key=found.get)
+                if len(found) > 1:
+                    log.warning(
+                        f"{len(found)} recording folders for "
+                        f"meeting_id={meeting_id} — using newest"
+                    )
                 log.info(
                     f"Found final S3 prefix [{dept}] "
                     f"for meeting_id={meeting_id}: {result}"
@@ -351,9 +375,10 @@ def process_finalize_message(msg: dict):
     time.sleep(WAIT_BEFORE_SEARCH)
 
     # ── Step 4: Search for final S3 path — retry up to 6 times ───────────
+    started      = get_tracking_started(temp_prefix)
     final_prefix = None
     for attempt in range(6):
-        final_prefix = find_final_s3_prefix(meeting_id)
+        final_prefix = find_final_s3_prefix(meeting_id, not_before=started)
         if final_prefix:
             break
         log.info(f"Attempt {attempt + 1}/6: final prefix not found yet, waiting 2 min...")

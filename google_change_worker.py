@@ -224,19 +224,38 @@ DEPARTMENTS = [
 ]
 
 
-def find_final_s3_prefix(meeting_id):
+OWN_SUBFOLDERS = ("docs", "llm")  # written by us, not by the recording Lambda
+
+
+def get_tracking_started(temp_prefix):
+    """initialized_at from the temp state.json (when this meeting's tracking began)."""
+    try:
+        obj   = s3.get_object(Bucket=S3_BUCKET, Key=f"{temp_prefix}/state.json")
+        state = json.loads(obj["Body"].read().decode("utf-8"))
+        return datetime.fromisoformat(state["initialized_at"])
+    except Exception as e:
+        log.warning(f"No tracking start time in {temp_prefix}/state.json: {e}")
+        return None
+
+
+def find_final_s3_prefix(meeting_id, not_before=None):
     """
     Search S3 for the final recording folder containing this meeting_id.
 
     meeting_id is always the LAST folder in the recording path (before the
     file-type folder) for every department, so the final prefix is simply
     everything up to and including the meeting_id segment.
+
+    A reused meeting_id (recurring meeting) has one recording folder per
+    session. Only folders whose recording files were uploaded at/after
+    not_before (this session's tracking start) qualify, and the newest wins,
+    so docs never land in — or overwrite — an older session's folder.
     """
     paginator  = s3.get_paginator("list_objects_v2")
     search_str = f"/{meeting_id}/"
 
     for dept in DEPARTMENTS:
-        found = set()
+        found = {}  # prefix -> newest recording-file LastModified
         try:
             for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=f"{dept}/"):
                 for obj in page.get("Contents", []):
@@ -248,10 +267,17 @@ def find_final_s3_prefix(meeting_id):
                         idx = parts.index(meeting_id)
                     except ValueError:
                         continue
-                    if len(parts) > idx + 1:
-                        found.add("/".join(parts[:idx + 1]))
+                    if len(parts) > idx + 1 and parts[idx + 1] not in OWN_SUBFOLDERS:
+                        pfx = "/".join(parts[:idx + 1])
+                        lm  = obj["LastModified"]
+                        if pfx not in found or lm > found[pfx]:
+                            found[pfx] = lm
+            if not_before:
+                found = {p: lm for p, lm in found.items() if lm >= not_before}
             if found:
-                result = sorted(found)[0]
+                result = max(found, key=found.get)
+                if len(found) > 1:
+                    log.warning(f"{len(found)} recording folders for meeting_id={meeting_id} — using newest")
                 log.info(f"Found final S3 prefix [{dept}] for meeting_id={meeting_id}: {result}")
                 return result
         except Exception as e:
@@ -321,7 +347,8 @@ def finalize_to_final_path(meeting_id, final_prefix):
 # ── MARK DOC IDLE + FINALIZE ──
 def mark_doc_idle(meeting_id):
     log.info(f"30-min idle for meeting_id={meeting_id} — searching final S3 path")
-    final_prefix = find_final_s3_prefix(meeting_id)
+    started      = get_tracking_started(_get_temp_prefix(meeting_id))
+    final_prefix = find_final_s3_prefix(meeting_id, not_before=started)
 
     if final_prefix:
         success = finalize_to_final_path(meeting_id, final_prefix)
@@ -348,7 +375,8 @@ def idle_retry_loop():
                 log.info(f"Idle retry: checking {len(idle_docs)} idle docs")
             for row in idle_docs:
                 mid          = row["meeting_id"]
-                final_prefix = find_final_s3_prefix(mid)
+                started      = get_tracking_started(_get_temp_prefix(mid))
+                final_prefix = find_final_s3_prefix(mid, not_before=started)
                 if final_prefix:
                     success = finalize_to_final_path(mid, final_prefix)
                     if success:
